@@ -1,0 +1,22 @@
+services:
+  fleet-manager:
+    build: .
+    ports:
+      - "8800:8800"
+    environment:
+      DATABASE_URL: sqlite:////data/fleet_manager.db
+      MASTER_ENCRYPTION_KEY: ${MASTER_ENCRYPTION_KEY}
+      SESSION_SECRET: ${SESSION_SECRET}
+      FLEET_ADMIN_EMAIL: ${FLEET_ADMIN_EMAIL:-admin@example.local}
+      FLEET_ADMIN_PASSWORD: ${FLEET_ADMIN_PASSWORD}
+      APP_TIMEZONE: ${APP_TIMEZONE:-America/Chicago}
+    volumes:
+      - fleet-manager-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8800/health/live', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  fleet-manager-data:
