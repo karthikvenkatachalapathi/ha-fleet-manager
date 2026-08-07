@@ -178,7 +178,9 @@ Reserved states:
 - Blocked
 - Manual Intervention Required
 
-## Phase 1 implemented scope
+## Implemented scope
+
+### Phase 1
 
 - Authenticated app shell.
 - Encrypted credential storage.
@@ -192,3 +194,25 @@ Reserved states:
 - Deterministic risk/critical classification.
 - Deployment plan preview.
 - Audit log.
+
+### Phase 2+
+
+- Approval records with exact target-version binding.
+- Notification table and manual-required notifications.
+- Job run records.
+- Operation records for guarded update execution.
+- Schedule records.
+- Backup record table scaffold.
+- Deterministic automation worker CLI.
+- Hermes cron wrapper scheduled every 6 hours.
+- Low-risk update execution path using `update.install` only after release-note review.
+- Automatic exclusion for Core, HAOS, Supervisor, firmware, router, Zigbee, Z-Wave, Matter, and Thread classes.
+- Vault documentation append for each successful install.
+
+Remaining future hardening:
+
+- Full backup capability detection/execution per HA installation type.
+- Production HTTPS deployment and secure cookies.
+- Rich UI controls for acknowledging notifications and editing schedules/policies.
+- Postgres migrations instead of `create_all`.
+- More precise release-note source adapters per ecosystem.

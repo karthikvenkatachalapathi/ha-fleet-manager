@@ -8,8 +8,8 @@ from ..models import Session as AppSession, User, now
 
 ph = PasswordHasher()
 PERMISSIONS = {
-  'admin': {'view_instances','add_instances','modify_instances','delete_instances','replace_credentials','view_updates','create_deployment_plans','approve_critical_updates','execute_deployment_plans','modify_update_policies','create_schedules','execute_backups','restore_backups','manage_notifications','view_audit_history','manage_users','manage_application_settings'},
-  'operator': {'view_instances','modify_instances','view_updates','create_deployment_plans','execute_deployment_plans','create_schedules','execute_backups','view_audit_history'},
+  'admin': {'view_instances','add_instances','modify_instances','delete_instances','replace_credentials','view_updates','create_deployment_plans','approve_critical_updates','approve_updates','execute_deployment_plans','execute_updates','modify_update_policies','create_schedules','execute_backups','restore_backups','manage_notifications','view_audit_history','manage_users','manage_application_settings'},
+  'operator': {'view_instances','modify_instances','view_updates','create_deployment_plans','execute_deployment_plans','execute_updates','create_schedules','execute_backups','view_audit_history'},
   'read_only': {'view_instances','view_updates','view_audit_history'}
 }
 

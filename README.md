@@ -21,7 +21,9 @@ The original read-only dashboard remains in `ha_update_dashboard/`. The new cont
 - Audit log.
 - Compact admin UI.
 
-Phase 1 is visibility/planning only. It does **not** execute updates yet.
+Current implemented scope includes visibility, planning, approval records, notifications, job runs, schedules, operation tracking, a deterministic monitor/automation worker, and low-risk update execution guarded by release-note review.
+
+Automation excludes Home Assistant Core, HAOS, Supervisor, firmware, router, Zigbee, Z-Wave, Matter, and Thread updates from automatic execution; those generate manual-required notifications only.
 
 ## Development quick start
 
@@ -81,6 +83,13 @@ compose up -d --build
 - `/api/instances`
 - `/api/updates`
 - `/api/deployments`
+- `/api/approvals`
+- `/api/notifications`
+- `/api/operations`
+- `/api/jobs`
+- `/api/backups`
+- `/api/schedules`
+- `/api/automation/run`
 - `/api/audit`
 
 There is intentionally no generic `/api/proxy` endpoint.
@@ -112,8 +121,34 @@ pytest -q
 Expected current result:
 
 ```text
-8 passed
+10 passed
 ```
+
+## Automation worker
+
+Manual one-shot dry run:
+
+```bash
+set -a && . ./.env.local && set +a
+. .venv/bin/activate
+python -m fleet_manager.automation_cli --dry-run
+```
+
+Manual guarded execution:
+
+```bash
+set -a && . ./.env.local && set +a
+. .venv/bin/activate
+python -m fleet_manager.automation_cli --execute
+```
+
+The Hermes cron wrapper is:
+
+```text
+/home/hermes/.hermes/profiles/reasoning/scripts/ha_fleet_manager_cron.py
+```
+
+It runs every 6 hours through Hermes cron job `c22531feff38`. It is silent when nothing new needs attention; it reports only new manual-required items, sync failures, blocked items, or completed auto-installs.
 
 ## Architecture
 

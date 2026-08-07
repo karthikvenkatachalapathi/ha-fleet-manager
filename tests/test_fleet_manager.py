@@ -6,8 +6,9 @@ os.environ['FLEET_ADMIN_PASSWORD'] = 'test-password'
 os.environ['DATABASE_URL'] = 'sqlite:///' + str(Path(tempfile.mkdtemp(prefix='hafm-test-')) / 'test.db')
 
 from fleet_manager.db import Base, engine, SessionLocal
-from fleet_manager.models import Instance, UpdateRecord
+from fleet_manager.models import Instance, UpdateRecord, Notification
 from fleet_manager.services.credentials import CredentialService
+from fleet_manager.services.automation import review_update_for_auto, monitor_and_act
 from fleet_manager.services.release_parser import parse_breaking_sections
 from fleet_manager.services.ha_adapter import categorize, risk_for
 
@@ -56,4 +57,33 @@ def test_approval_is_version_bound_in_plan_summary():
     upd.available_version = '2026.8.2'
     assert target_versions[str(upd.id)] == '2026.8.1'
     assert upd.available_version == '2026.8.2'
+    db.close()
+
+
+def test_auto_review_blocks_missing_release_notes():
+    db = SessionLocal()
+    inst = Instance(friendly_name='AutoReview', url='http://ha.local')
+    db.add(inst); db.flush()
+    upd = UpdateRecord(instance_id=inst.id, entity_id='update.safe', component='Small Add-on', category='Add-on', installed_version='1.0', available_version='1.1', approval_state='not_required', installation_state='available', critical_state=False, risk_level='low')
+    db.add(upd); db.commit()
+    ok, reasons, notes = review_update_for_auto(upd)
+    assert ok is False
+    assert notes is None
+    assert 'missing_or_non_public_release_url' in reasons
+    db.close()
+
+
+def test_monitor_creates_manual_notification_for_core_update():
+    db = SessionLocal()
+    inst = Instance(friendly_name='NotifyCore', url='http://ha.local')
+    db.add(inst); db.flush()
+    upd = UpdateRecord(instance_id=inst.id, entity_id='update.home_assistant_core_update', component='Home Assistant Core', category='Core', installed_version='2026.7.4', available_version='2026.8.1', critical_state=True, approval_state='required', installation_state='available', risk_level='high')
+    db.add(upd); db.commit()
+    # Exercise the notification path directly by bypassing live sync with monkeypatch-style local call inputs.
+    from fleet_manager.services.automation import mark_manual_notifications
+    mark_manual_notifications(db, inst, upd)
+    db.commit()
+    n = db.query(Notification).filter(Notification.title.like('%Manual Home Assistant update required%')).one_or_none()
+    assert n is not None
+    assert n.severity == 'warning'
     db.close()

@@ -8,12 +8,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from .db import Base, engine, get_db, SessionLocal
-from .models import AuditEvent, DeploymentPlan, Instance, Operation, UpdateRecord, User, now
+from .models import Approval, AuditEvent, BackupRecord, DeploymentPlan, Instance, JobRun, Notification, Operation, Schedule, UpdateRecord, User, now
 from .settings import SESSION_COOKIE, CSRF_HEADER
 from .services.auth import create_session, ensure_admin, require_permission, validate_session, verify_password
 from .services.audit import audit
 from .services.credentials import CredentialService
 from .services.ha_adapter import HomeAssistantAdapter, persist_instance_health, sync_updates, validate_instance_url
+from .services.automation import monitor_and_act, review_update_for_auto
 
 app = FastAPI(title='Home Assistant Fleet Manager', version='0.1.0')
 ROOT = __import__('pathlib').Path(__file__).resolve().parents[1]
@@ -32,6 +33,10 @@ class InstanceIn(BaseModel):
 class DeploymentPlanIn(BaseModel):
     name: str
     update_ids: list[int]
+class ApprovalIn(BaseModel):
+    reason: str | None = None
+class AutomationRunIn(BaseModel):
+    auto_execute: bool = False
 
 def startup_init():
     Base.metadata.create_all(engine)
@@ -158,3 +163,81 @@ def deployment_list(s=Depends(current_session), db: Session = Depends(get_db)):
 @app.get('/api/audit')
 def audit_log(s=Depends(current_session), db: Session = Depends(get_db)):
     require_permission(s,'view_audit_history'); return [{'timestamp':a.timestamp.isoformat(),'actor_user_id':a.actor_user_id,'action':a.action,'resource_type':a.resource_type,'resource_id':a.resource_id,'instance_id':a.instance_id,'result':a.result,'metadata':json.loads(a.metadata_json or '{}')} for a in db.query(AuditEvent).order_by(AuditEvent.id.desc()).limit(200).all()]
+
+@app.get('/api/approvals')
+def approvals(s=Depends(current_session), db: Session = Depends(get_db)):
+    require_permission(s,'create_deployment_plans')
+    rows=[]
+    updates={u.id:u for u in db.query(UpdateRecord).all()}
+    instances={i.id:i for i in db.query(Instance).all()}
+    for a in db.query(Approval).order_by(Approval.id.desc()).all():
+        u=updates.get(a.update_record_id); inst=instances.get(a.instance_id)
+        rows.append({'id':a.id,'status':a.status,'target_version':a.target_version,'reason':a.reason,'created_at':a.created_at.isoformat(),'decided_at':a.decided_at.isoformat() if a.decided_at else None,'update':serialize_update(u) if u else None,'instance':inst.friendly_name if inst else None})
+    return rows
+
+@app.post('/api/updates/{update_id}/approve')
+def approve_update(update_id:int, data: ApprovalIn, s=Depends(csrf), db: Session = Depends(get_db)):
+    require_permission(s,'approve_updates')
+    u=db.get(UpdateRecord, update_id)
+    if not u: raise HTTPException(404,'Update not found')
+    if not u.available_version: raise HTTPException(422,'Update has no target version')
+    a=db.query(Approval).filter_by(update_record_id=u.id, target_version=u.available_version).one_or_none()
+    if not a:
+        a=Approval(update_record_id=u.id, instance_id=u.instance_id, target_version=u.available_version, requested_by=s.user_id)
+        db.add(a)
+    a.status='approved'; a.approved_by=s.user_id; a.reason=data.reason; a.decided_at=now(); u.approval_state='approved'
+    audit(db, action='update_approved', resource_type='update_record', actor_user_id=s.user_id, resource_id=u.id, instance_id=u.instance_id, metadata={'target_version':u.available_version})
+    db.commit(); return {'ok':True,'approval_id':a.id,'target_version':a.target_version}
+
+@app.post('/api/updates/{update_id}/reject')
+def reject_update(update_id:int, data: ApprovalIn, s=Depends(csrf), db: Session = Depends(get_db)):
+    require_permission(s,'approve_updates')
+    u=db.get(UpdateRecord, update_id)
+    if not u: raise HTTPException(404,'Update not found')
+    a=db.query(Approval).filter_by(update_record_id=u.id, target_version=u.available_version).one_or_none()
+    if not a:
+        a=Approval(update_record_id=u.id, instance_id=u.instance_id, target_version=u.available_version or 'unknown', requested_by=s.user_id)
+        db.add(a)
+    a.status='rejected'; a.approved_by=s.user_id; a.reason=data.reason; a.decided_at=now(); u.approval_state='rejected'
+    audit(db, action='update_rejected', resource_type='update_record', actor_user_id=s.user_id, resource_id=u.id, instance_id=u.instance_id, metadata={'target_version':u.available_version})
+    db.commit(); return {'ok':True,'approval_id':a.id}
+
+@app.post('/api/updates/{update_id}/review')
+def review_update(update_id:int, s=Depends(csrf), db: Session = Depends(get_db)):
+    require_permission(s,'view_updates')
+    u=db.get(UpdateRecord, update_id)
+    if not u: raise HTTPException(404,'Update not found')
+    ok,reasons,_notes=review_update_for_auto(u)
+    audit(db, action='release_notes_reviewed', resource_type='update_record', actor_user_id=s.user_id, resource_id=u.id, instance_id=u.instance_id, metadata={'eligible':ok,'reasons':reasons})
+    db.commit(); return {'eligible_for_auto':ok,'reasons':reasons,'update':serialize_update(u)}
+
+@app.post('/api/automation/run')
+def automation_run(data: AutomationRunIn, s=Depends(csrf), db: Session = Depends(get_db)):
+    require_permission(s,'execute_updates')
+    summary=monitor_and_act(db, auto_execute=data.auto_execute, actor=f'user:{s.user.email}')
+    db.commit(); return summary
+
+@app.get('/api/notifications')
+def notifications(s=Depends(current_session), db: Session = Depends(get_db)):
+    require_permission(s,'view_audit_history')
+    return [{'id':n.id,'severity':n.severity,'title':n.title,'body':n.body,'status':n.status,'instance_id':n.instance_id,'update_record_id':n.update_record_id,'created_at':n.created_at.isoformat(),'acknowledged_at':n.acknowledged_at.isoformat() if n.acknowledged_at else None} for n in db.query(Notification).order_by(Notification.id.desc()).limit(200).all()]
+
+@app.get('/api/operations')
+def operations(s=Depends(current_session), db: Session = Depends(get_db)):
+    require_permission(s,'view_audit_history')
+    return [{'id':o.id,'kind':o.kind,'instance_id':o.instance_id,'deployment_plan_id':o.deployment_plan_id,'state':o.state,'status':o.status,'started_at':o.started_at.isoformat() if o.started_at else None,'ended_at':o.ended_at.isoformat() if o.ended_at else None,'details':json.loads(o.details_json or '{}')} for o in db.query(Operation).order_by(Operation.id.desc()).limit(200).all()]
+
+@app.get('/api/jobs')
+def jobs(s=Depends(current_session), db: Session = Depends(get_db)):
+    require_permission(s,'view_audit_history')
+    return [{'id':j.id,'kind':j.kind,'status':j.status,'started_at':j.started_at.isoformat(),'ended_at':j.ended_at.isoformat() if j.ended_at else None,'details':json.loads(j.details_json or '{}')} for j in db.query(JobRun).order_by(JobRun.id.desc()).limit(100).all()]
+
+@app.get('/api/backups')
+def backups(s=Depends(current_session), db: Session = Depends(get_db)):
+    require_permission(s,'view_audit_history')
+    return [{'id':b.id,'instance_id':b.instance_id,'provider':b.provider,'status':b.status,'backup_id':b.backup_id,'name':b.name,'started_at':b.started_at.isoformat() if b.started_at else None,'completed_at':b.completed_at.isoformat() if b.completed_at else None,'details':json.loads(b.details_json or '{}')} for b in db.query(BackupRecord).order_by(BackupRecord.id.desc()).limit(100).all()]
+
+@app.get('/api/schedules')
+def schedules(s=Depends(current_session), db: Session = Depends(get_db)):
+    require_permission(s,'view_audit_history')
+    return [{'id':x.id,'name':x.name,'kind':x.kind,'cron':x.cron,'enabled':x.enabled,'last_run_at':x.last_run_at.isoformat() if x.last_run_at else None,'created_at':x.created_at.isoformat()} for x in db.query(Schedule).order_by(Schedule.id.desc()).all()]

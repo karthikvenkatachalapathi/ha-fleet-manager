@@ -134,3 +134,60 @@ class Operation(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     details_json: Mapped[str] = mapped_column(Text, default='{}')
+
+class Approval(Base):
+    __tablename__ = 'approvals'
+    __table_args__ = (UniqueConstraint('update_record_id', 'target_version', name='uq_approval_update_target'),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    update_record_id: Mapped[int] = mapped_column(ForeignKey('update_records.id'), index=True)
+    instance_id: Mapped[int] = mapped_column(ForeignKey('instances.id'), index=True)
+    target_version: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(40), default='pending')
+    requested_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    approved_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+class Notification(Base):
+    __tablename__ = 'notifications'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    severity: Mapped[str] = mapped_column(String(40), default='info')
+    title: Mapped[str] = mapped_column(String(300))
+    body: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(40), default='open')
+    instance_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    update_record_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+class BackupRecord(Base):
+    __tablename__ = 'backup_records'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    instance_id: Mapped[int] = mapped_column(ForeignKey('instances.id'), index=True)
+    provider: Mapped[str] = mapped_column(String(80), default='home_assistant')
+    status: Mapped[str] = mapped_column(String(40), default='unknown')
+    backup_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    name: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    details_json: Mapped[str] = mapped_column(Text, default='{}')
+
+class Schedule(Base):
+    __tablename__ = 'schedules'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(200))
+    kind: Mapped[str] = mapped_column(String(80), default='monitor')
+    cron: Mapped[str] = mapped_column(String(120))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class JobRun(Base):
+    __tablename__ = 'job_runs'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(40), default='running')
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    details_json: Mapped[str] = mapped_column(Text, default='{}')
