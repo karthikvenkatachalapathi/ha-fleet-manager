@@ -1,0 +1,11 @@
+{
+  "instances": [
+    {
+      "alias": "home",
+      "label": "Home",
+      "role": "primary_residence",
+      "url": "https://homeassistant.example.com",
+      "token_key": "HASS_TOKEN_HOME"
+    }
+  ]
+}

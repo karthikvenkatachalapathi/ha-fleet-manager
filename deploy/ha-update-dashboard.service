@@ -1,0 +1,15 @@
+[Unit]
+Description=Home Assistant Update Dashboard
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hermes/ha-update-dashboard
+Environment=PYTHONUNBUFFERED=1
+Environment=HA_UPDATE_DASHBOARD_CONFIG=/home/hermes/ha-update-dashboard/config.local.json
+ExecStart=/usr/bin/python3 -m ha_update_dashboard.server --host 0.0.0.0 --port 8799
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
