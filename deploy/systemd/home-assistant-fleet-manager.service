@@ -1,0 +1,16 @@
+[Unit]
+Description=Home Assistant Fleet Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hermes/ha-update-dashboard
+EnvironmentFile=/home/hermes/ha-update-dashboard/.env.local
+ExecStart=/home/hermes/ha-update-dashboard/.venv/bin/uvicorn fleet_manager.app:app --host 0.0.0.0 --port 8799
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

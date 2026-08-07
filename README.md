@@ -21,7 +21,7 @@ The original read-only dashboard remains in `ha_update_dashboard/`. The new cont
 - Audit log.
 - Compact admin UI.
 
-Current implemented scope includes visibility, planning, approval records, notifications, job runs, schedules, operation tracking, a deterministic monitor/automation worker, and low-risk update execution guarded by release-note review.
+Current implemented scope includes visibility, planning, approval records, notifications, job runs, schedules, operation tracking, a deterministic monitor/automation worker, low-risk update execution guarded by release-note review, login throttling, notification acknowledgement, schedule/policy editing, per-instance backup creation, and a durable user systemd service.
 
 Automation excludes Home Assistant Core, HAOS, Supervisor, firmware, router, Zigbee, Z-Wave, Matter, and Thread updates from automatic execution; those generate manual-required notifications only.
 
@@ -122,6 +122,33 @@ Expected current result:
 
 ```text
 10 passed
+```
+
+## Service mode
+
+Fleet Manager is installed as a user systemd service:
+
+```bash
+systemctl --user status home-assistant-fleet-manager.service
+systemctl --user restart home-assistant-fleet-manager.service
+```
+
+Service unit source:
+
+```text
+deploy/systemd/home-assistant-fleet-manager.service
+```
+
+Active local URL:
+
+```text
+http://192.168.2.107:8799
+```
+
+Reverse-proxy notes are in:
+
+```text
+deploy/reverse-proxy.md
 ```
 
 ## Automation worker

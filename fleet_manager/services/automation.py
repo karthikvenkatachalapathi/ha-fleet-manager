@@ -222,3 +222,32 @@ def monitor_and_act(db: Session, *, auto_execute: bool = True, actor: str = 'aut
         job.status = 'failed'; job.ended_at = now(); job.details_json = json.dumps({'error': type(exc).__name__, 'message': str(exc)[:500], 'summary': summary}, default=str)
         audit(db, action='monitor_and_act_failed', resource_type='job_run', resource_id=job.id, result='failed', metadata={'error': type(exc).__name__})
         raise
+
+
+def create_instance_backup(db: Session, inst: Instance, *, actor: str = 'user') -> BackupRecord:
+    token = CredentialService().get_instance_token(db, inst.id)
+    adapter = HomeAssistantAdapter(inst, token)
+    rec = BackupRecord(instance_id=inst.id, provider='home_assistant', status='running', started_at=now(), name=f'Fleet Manager backup {ct_now()}')
+    db.add(rec); db.flush()
+    details = {'actor': actor, 'attempts': []}
+    try:
+        try:
+            response = adapter.post('/api/services/backup/create', {'name': rec.name})
+            details['attempts'].append({'endpoint': '/api/services/backup/create', 'ok': True})
+        except Exception as exc:
+            details['attempts'].append({'endpoint': '/api/services/backup/create', 'ok': False, 'error': type(exc).__name__})
+            response = adapter.post('/api/hassio/backups/new/full', {'name': rec.name})
+            details['attempts'].append({'endpoint': '/api/hassio/backups/new/full', 'ok': True})
+        rec.status = 'completed'; rec.completed_at = now()
+        rec.backup_id = str((response or {}).get('slug') or (response or {}).get('backup_id') or '') or None
+        inst.last_successful_backup = rec.completed_at; inst.backup_compliance_state = 'current'
+        details['response_summary'] = {k: v for k, v in (response or {}).items() if k in {'slug','backup_id','name','date'}} if isinstance(response, dict) else {}
+        append_vault_update_log(f'{ct_now()} — {inst.friendly_name} — backup created', [f'- Instance: {inst.friendly_name}', f'- Backup record ID: {rec.id}', f'- Backup ID: {rec.backup_id or "not returned"}', f'- Actor: {actor}', '- Result: completed'])
+        audit(db, action='backup_created', resource_type='backup_record', resource_id=rec.id, instance_id=inst.id, result='success', metadata={'actor': actor})
+    except Exception as exc:
+        rec.status = 'unsupported_or_failed'; rec.completed_at = now()
+        details['error'] = {'type': type(exc).__name__, 'message': str(exc)[:300]}
+        create_notification(db, severity='warning', title=f'Home Assistant backup unavailable: {inst.friendly_name}', body=f'{type(exc).__name__}: {str(exc)[:300]}', instance_id=inst.id)
+        audit(db, action='backup_failed', resource_type='backup_record', resource_id=rec.id, instance_id=inst.id, result='failed', metadata={'error': type(exc).__name__})
+    rec.details_json = json.dumps(details, default=str)
+    return rec

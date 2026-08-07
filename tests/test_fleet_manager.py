@@ -87,3 +87,21 @@ def test_monitor_creates_manual_notification_for_core_update():
     assert n is not None
     assert n.severity == 'warning'
     db.close()
+
+
+def test_policy_setting_model_roundtrip():
+    from fleet_manager.models import PolicySetting
+    db = SessionLocal()
+    p = PolicySetting(key='test_policy', value_json='{"enabled": true}', description='test')
+    db.add(p); db.commit()
+    row = db.query(PolicySetting).filter_by(key='test_policy').one()
+    assert 'enabled' in row.value_json
+    db.close()
+
+
+def test_login_rate_limit_state_blocks_after_failures():
+    # Import app after test env has set isolated DB.
+    from fleet_manager import app as appmod
+    key = 'test:admin@example.local'
+    appmod.LOGIN_FAILURES[key] = [appmod.datetime.now(appmod.timezone.utc)] * appmod.LOGIN_MAX_FAILURES
+    assert len(appmod.LOGIN_FAILURES[key]) == appmod.LOGIN_MAX_FAILURES

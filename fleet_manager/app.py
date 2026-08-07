@@ -1,6 +1,8 @@
 from __future__ import annotations
 import json
 from typing import Annotated
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -8,17 +10,20 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from .db import Base, engine, get_db, SessionLocal
-from .models import Approval, AuditEvent, BackupRecord, DeploymentPlan, Instance, JobRun, Notification, Operation, Schedule, UpdateRecord, User, now
+from .models import Approval, AuditEvent, BackupRecord, DeploymentPlan, Instance, JobRun, Notification, Operation, PolicySetting, Schedule, UpdateRecord, User, now
 from .settings import SESSION_COOKIE, CSRF_HEADER
 from .services.auth import create_session, ensure_admin, require_permission, validate_session, verify_password
 from .services.audit import audit
 from .services.credentials import CredentialService
 from .services.ha_adapter import HomeAssistantAdapter, persist_instance_health, sync_updates, validate_instance_url
-from .services.automation import monitor_and_act, review_update_for_auto
+from .services.automation import create_instance_backup, monitor_and_act, review_update_for_auto
 
 app = FastAPI(title='Home Assistant Fleet Manager', version='0.1.0')
 ROOT = __import__('pathlib').Path(__file__).resolve().parents[1]
 app.mount('/assets', StaticFiles(directory=ROOT / 'fleet_manager' / 'static'), name='assets')
+LOGIN_FAILURES: dict[str, list[datetime]] = defaultdict(list)
+LOGIN_MAX_FAILURES = 5
+LOGIN_WINDOW = timedelta(minutes=15)
 
 class LoginIn(BaseModel):
     email: str
@@ -37,11 +42,29 @@ class ApprovalIn(BaseModel):
     reason: str | None = None
 class AutomationRunIn(BaseModel):
     auto_execute: bool = False
+class ScheduleIn(BaseModel):
+    name: str | None = None
+    kind: str | None = None
+    cron: str | None = None
+    enabled: bool | None = None
+class PolicyIn(BaseModel):
+    value: dict
+    description: str | None = None
+
+def ensure_app_defaults(db: Session):
+    if db.query(Schedule).count() == 0:
+        db.add(Schedule(name='Default monitor cadence', kind='monitor_and_act', cron='0 */6 * * *', enabled=True))
+    defaults = {'auto_update_policy': {'auto_execute_enabled': True, 'excluded_categories': ['Core','OS','Supervisor','Firmware'], 'excluded_stacks': ['router','zigbee','z-wave','matter','thread'], 'safe_categories': ['Add-on','HACS','Update Entity'], 'requires_public_release_notes': True, 'block_on_breaking_or_action_required': True, 'core_haos_manual_only': True}}
+    for key, value in defaults.items():
+        if not db.query(PolicySetting).filter_by(key=key).one_or_none():
+            db.add(PolicySetting(key=key, value_json=json.dumps(value), description='Fleet Manager deterministic update safety policy'))
+    db.commit()
 
 def startup_init():
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
         ensure_admin(db)
+        ensure_app_defaults(db)
 startup_init()
 
 def current_session(request: Request, db: Session = Depends(get_db)):
@@ -83,10 +106,18 @@ def ready(db: Session = Depends(get_db)):
     return {'ok': True, 'database': 'ok'}
 @app.post('/api/auth/login')
 def login(data: LoginIn, response: Response, request: Request, db: Session = Depends(get_db)):
+    key=f'{request.client.host if request.client else "unknown"}:{data.email.lower()}'
+    cutoff=datetime.now(timezone.utc)-LOGIN_WINDOW
+    LOGIN_FAILURES[key]=[t for t in LOGIN_FAILURES[key] if t>cutoff]
+    if len(LOGIN_FAILURES[key]) >= LOGIN_MAX_FAILURES:
+        audit(db, action='login_rate_limited', resource_type='auth', result='blocked', metadata={'email': data.email}); db.commit()
+        raise HTTPException(429, 'Too many failed login attempts; try again later')
     user=db.query(User).filter_by(email=data.email).one_or_none()
     if not user or not verify_password(user.password_hash, data.password):
+        LOGIN_FAILURES[key].append(datetime.now(timezone.utc))
         audit(db, action='failed_login', resource_type='auth', result='failed', metadata={'email': data.email}); db.commit()
         raise HTTPException(401, 'Invalid email or password')
+    LOGIN_FAILURES.pop(key, None)
     s=create_session(db,user); audit(db, action='login', resource_type='auth', actor_user_id=user.id); db.commit()
     response.set_cookie(SESSION_COOKIE, s.id, httponly=True, samesite='lax', secure=False, max_age=43200)
     return {'ok': True, 'user': {'email': user.email, 'role': user.role}, 'csrf_token': s.csrf_token}
@@ -241,3 +272,52 @@ def backups(s=Depends(current_session), db: Session = Depends(get_db)):
 def schedules(s=Depends(current_session), db: Session = Depends(get_db)):
     require_permission(s,'view_audit_history')
     return [{'id':x.id,'name':x.name,'kind':x.kind,'cron':x.cron,'enabled':x.enabled,'last_run_at':x.last_run_at.isoformat() if x.last_run_at else None,'created_at':x.created_at.isoformat()} for x in db.query(Schedule).order_by(Schedule.id.desc()).all()]
+
+
+@app.post('/api/notifications/{notification_id}/ack')
+def ack_notification(notification_id:int, s=Depends(csrf), db: Session = Depends(get_db)):
+    require_permission(s,'manage_notifications')
+    n=db.get(Notification, notification_id)
+    if not n: raise HTTPException(404,'Notification not found')
+    n.status='acknowledged'; n.acknowledged_at=now()
+    audit(db, action='notification_acknowledged', resource_type='notification', actor_user_id=s.user_id, resource_id=n.id)
+    db.commit(); return {'ok':True,'id':n.id,'status':n.status}
+
+@app.post('/api/instances/{instance_id}/backup')
+def backup_instance(instance_id:int, s=Depends(csrf), db: Session = Depends(get_db)):
+    require_permission(s,'execute_backups')
+    inst=db.get(Instance, instance_id)
+    if not inst: raise HTTPException(404,'Instance not found')
+    rec=create_instance_backup(db, inst, actor=f'user:{s.user.email}')
+    db.commit(); return {'id':rec.id,'status':rec.status,'backup_id':rec.backup_id,'details':json.loads(rec.details_json or '{}')}
+
+@app.patch('/api/schedules/{schedule_id}')
+def update_schedule(schedule_id:int, data: ScheduleIn, s=Depends(csrf), db: Session = Depends(get_db)):
+    require_permission(s,'create_schedules')
+    sched=db.get(Schedule, schedule_id)
+    if not sched: raise HTTPException(404,'Schedule not found')
+    before={'name':sched.name,'kind':sched.kind,'cron':sched.cron,'enabled':sched.enabled}
+    if data.name is not None: sched.name=data.name
+    if data.kind is not None: sched.kind=data.kind
+    if data.cron is not None: sched.cron=data.cron
+    if data.enabled is not None: sched.enabled=data.enabled
+    after={'name':sched.name,'kind':sched.kind,'cron':sched.cron,'enabled':sched.enabled}
+    audit(db, action='schedule_updated', resource_type='schedule', actor_user_id=s.user_id, resource_id=sched.id, before=before, after=after)
+    db.commit(); return {'id':sched.id,**after}
+
+@app.get('/api/policies')
+def policies(s=Depends(current_session), db: Session = Depends(get_db)):
+    require_permission(s,'modify_update_policies')
+    return [{'id':p.id,'key':p.key,'value':json.loads(p.value_json or '{}'),'description':p.description,'updated_at':p.updated_at.isoformat()} for p in db.query(PolicySetting).order_by(PolicySetting.key).all()]
+
+@app.put('/api/policies/{key}')
+def put_policy(key:str, data: PolicyIn, s=Depends(csrf), db: Session = Depends(get_db)):
+    require_permission(s,'modify_update_policies')
+    p=db.query(PolicySetting).filter_by(key=key).one_or_none()
+    if not p:
+        p=PolicySetting(key=key); db.add(p)
+    before=json.loads(p.value_json or '{}')
+    p.value_json=json.dumps(data.value, sort_keys=True)
+    if data.description is not None: p.description=data.description
+    audit(db, action='policy_updated', resource_type='policy_setting', actor_user_id=s.user_id, resource_id=key, before=before, after=data.value)
+    db.commit(); return {'key':p.key,'value':json.loads(p.value_json),'description':p.description,'updated_at':p.updated_at.isoformat()}
