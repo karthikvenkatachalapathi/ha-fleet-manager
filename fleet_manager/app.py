@@ -10,12 +10,13 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from .db import Base, engine, get_db, SessionLocal
-from .models import Approval, AuditEvent, BackupRecord, DeploymentPlan, Instance, InstanceCredential, JobRun, Notification, Operation, PolicySetting, Schedule, UpdateRecord, User, now
+from .models import Approval, AuditEvent, BackupRecord, DeploymentPlan, Instance, InstanceCredential, JobRun, Notification, Operation, PolicySetting, Schedule, UpdateRecord, User, Session as AppSession, now
 from .settings import SESSION_COOKIE, CSRF_HEADER
 from .services.auth import create_session, ensure_admin, ph, require_permission, validate_session, verify_password
 from .services.audit import audit
@@ -24,6 +25,7 @@ from .services.ha_adapter import HomeAssistantAdapter, persist_instance_health, 
 from .services.automation import create_instance_backup, install_update, load_auto_policy, monitor_and_act, review_update_for_auto, skip_update, update_matches_stack
 
 app = FastAPI(title='Home Assistant Fleet Manager', version='0.1.0')
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 ROOT = __import__('pathlib').Path(__file__).resolve().parents[1]
 app.mount('/assets', StaticFiles(directory=ROOT / 'fleet_manager' / 'static'), name='assets')
 LOGIN_FAILURES: dict[str, list[datetime]] = defaultdict(list)
@@ -121,6 +123,52 @@ def csrf(request: Request, s=Depends(current_session)):
         if request.headers.get(CSRF_HEADER) != s.csrf_token:
             raise HTTPException(403, 'CSRF validation failed')
     return s
+
+
+@app.get('/manifest.webmanifest')
+def pwa_manifest():
+    return FileResponse(ROOT / 'fleet_manager' / 'static' / 'manifest.webmanifest', media_type='application/manifest+json')
+
+@app.get('/sw.js')
+def service_worker():
+    return FileResponse(ROOT / 'fleet_manager' / 'static' / 'sw.js', media_type='application/javascript', headers={'Cache-Control': 'no-cache', 'Service-Worker-Allowed': '/'})
+
+@app.middleware('http')
+async def audit_mutating_api_requests(request: Request, call_next):
+    should_audit = request.method in {'POST', 'PATCH', 'PUT', 'DELETE'} and request.url.path.startswith('/api/')
+    actor_user_id = None
+    if should_audit:
+        session_id = request.cookies.get(SESSION_COOKIE)
+        if session_id:
+            try:
+                with SessionLocal() as audit_db:
+                    sess = audit_db.get(AppSession, session_id)
+                    if sess and not sess.revoked_at and sess.expires_at > now():
+                        actor_user_id = sess.user_id
+            except Exception:
+                actor_user_id = None
+    response = await call_next(request)
+    if should_audit:
+        try:
+            with SessionLocal() as audit_db:
+                audit_db.add(AuditEvent(
+                    actor_user_id=actor_user_id,
+                    action='ui_api_action',
+                    resource_type='api_request',
+                    resource_id=request.url.path[:120],
+                    result='success' if response.status_code < 400 else 'failed',
+                    metadata_json=json.dumps({
+                        'method': request.method,
+                        'path': request.url.path,
+                        'status_code': response.status_code,
+                        'page': request.headers.get('x-fleet-page') or 'unknown',
+                        'menu': request.headers.get('x-fleet-menu') or 'unknown',
+                    }),
+                ))
+                audit_db.commit()
+        except Exception:
+            pass
+    return response
 
 def serialize_instance(i: Instance):
     return {k:getattr(i,k) for k in ['id','friendly_name','url','environment','location','installation_type','ha_core_version','supervisor_version','ha_os_version','connectivity_state','health_state','available_updates','critical_updates','pending_approvals','backup_compliance_state','maintenance_window','update_policy','maintenance_hold'] } | {
@@ -428,8 +476,9 @@ def restart_instance(instance_id:int, s=Depends(csrf), db: Session = Depends(get
     token=CredentialService().get_instance_token(db, inst.id)
     try:
         HomeAssistantAdapter(inst, token).post('/api/services/homeassistant/restart', {})
-        audit(db, action='instance_restart_requested', resource_type='instance', actor_user_id=s.user_id, resource_id=inst.id, instance_id=inst.id, metadata={'name': inst.friendly_name})
-        db.commit(); return {'ok': True, 'message': 'Restart requested'}
+        inst.connectivity_state='restarting'; inst.health_state='restarting'; inst.last_failed_connection=now()
+        audit(db, action='instance_restart_requested', resource_type='instance', actor_user_id=s.user_id, resource_id=inst.id, instance_id=inst.id, metadata={'name': inst.friendly_name, 'state': 'restarting'})
+        db.commit(); return {'ok': True, 'message': 'Restart requested', 'state': 'restarting'}
     except Exception as exc:
         audit(db, action='instance_restart_failed', resource_type='instance', actor_user_id=s.user_id, resource_id=inst.id, instance_id=inst.id, result='failed', metadata={'error': type(exc).__name__})
         db.commit(); raise HTTPException(502, str(exc))
@@ -513,11 +562,13 @@ def fix_repair(data: RepairFixIn, s=Depends(csrf), db: Session = Depends(get_db)
         adapter = HomeAssistantAdapter(inst, token)
         if requested_action == 'host_reboot':
             adapter.trigger_shutdown_automations('host_reboot')
+            inst.connectivity_state='restarting'; inst.health_state='restarting'; inst.last_failed_connection=now()
+            db.flush()
             time.sleep(3)
-            adapter.post('/api/services/hassio/host_reboot', {})
+            reboot_result = adapter.host_reboot()
         else:
             raise HTTPException(422, 'No Fleet Manager action for this repair')
-        audit(db, action='repair_fix_requested', resource_type='repair', actor_user_id=s.user_id, resource_id=data.issue_id, instance_id=inst.id, metadata={'domain': data.domain, 'issue_id': data.issue_id, 'action': requested_action})
+        audit(db, action='repair_fix_requested', resource_type='repair', actor_user_id=s.user_id, resource_id=data.issue_id, instance_id=inst.id, metadata={'domain': data.domain, 'issue_id': data.issue_id, 'action': requested_action, 'state': inst.connectivity_state, 'reboot_endpoint': reboot_result.get('endpoint'), 'attempts': reboot_result.get('attempts')})
         db.commit(); return {'ok': True, 'message': 'Repair action started'}
     except HTTPException:
         raise

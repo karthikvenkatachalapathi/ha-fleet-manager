@@ -1,6 +1,6 @@
-# Nginx Proxy Manager / reverse proxy notes
+# Reverse proxy notes
 
-Recommended public/internal hostname:
+Example hostname:
 
 ```text
 fleet-manager.example.com
@@ -12,15 +12,16 @@ Backend target:
 http://127.0.0.1:8799
 ```
 
-Current app cookie is `HttpOnly` + `SameSite=Lax`. Enable TLS at the reverse proxy. If exposing beyond LAN/Tailscale, place behind Authentik or IP allowlist.
+Use TLS at the proxy. If you expose Fleet Manager beyond a private network, put it behind SSO, an IP allowlist, VPN, or an equivalent access control layer.
 
-NPM advanced options:
+Nginx-style headers:
 
 ```nginx
+proxy_set_header Host $host;
 proxy_set_header X-Forwarded-Proto $scheme;
 proxy_set_header X-Forwarded-Host $host;
 proxy_set_header X-Real-IP $remote_addr;
 client_max_body_size 20m;
 ```
 
-Do not configure proxying to the Home Assistant instances directly through Fleet Manager; it intentionally has no generic proxy endpoint.
+Do not configure Fleet Manager as a pass-through proxy to Home Assistant. It intentionally does not expose generic proxying.

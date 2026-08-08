@@ -1,6 +1,6 @@
-# Docker Guide
+# Docker
 
-## Compose quick start
+## Compose
 
 ```bash
 cp .env.example .env
@@ -10,7 +10,7 @@ docker compose up -d --build
 
 Open `http://127.0.0.1:8800`.
 
-## Required environment
+Required values:
 
 ```env
 DATABASE_URL=sqlite:////data/fleet_manager.db
@@ -31,11 +31,11 @@ print('SESSION_SECRET=' + secrets.token_urlsafe(48))
 PY
 ```
 
-## Volumes
+## Runtime data
 
-Compose stores runtime state in `fleet-manager-data:/data`. Back up this volume plus your environment/secret source.
+Compose stores state in `fleet-manager-data:/data`. Back up that volume and the secret source used for `MASTER_ENCRYPTION_KEY`.
 
-## Build manually
+## Manual build
 
 ```bash
 docker build -t ha-fleet-manager:local .
@@ -51,7 +51,7 @@ curl -fsS http://127.0.0.1:8800/health/ready
 
 ## Production notes
 
-- Put a TLS reverse proxy in front of the container.
-- Do not bake `.env`, `.env.local`, SQLite DBs, or Home Assistant tokens into the image.
-- Keep `.dockerignore` strict so local state does not enter build context.
-- Prefer container secrets or an external secret manager over plaintext `.env` in production.
+- Put HTTPS in front of the container.
+- Do not bake `.env`, SQLite files, logs, or Home Assistant tokens into the image.
+- Keep `.dockerignore` strict.
+- Prefer container secrets or a secret manager over a plaintext production `.env` file.

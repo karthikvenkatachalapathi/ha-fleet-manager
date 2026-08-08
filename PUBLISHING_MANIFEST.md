@@ -1,46 +1,28 @@
-# Publishing Manifest
+# Publishing checklist
 
-Use this checklist before pushing to a public GitHub branch.
+Use this before pushing a public branch.
 
 ## Include
 
-- `README.md`
-- `SETUP.md`
-- `DEPLOYMENT.md`
-- `DOCKER.md`
-- `SECURITY.md`
-- `ARCHITECTURE.md`
-- `STANDARD_LINEAGE.md`
-- `.env.example`
-- `.gitignore`
-- `.dockerignore`
-- `Dockerfile`
-- `docker-compose.yml`
-- `fleet_manager/`
-- `ha_update_dashboard/` legacy source
-- `deploy/` examples with placeholder paths/domains
-- `docs/` sanitized supporting docs
-- `tests/`
-- `requirements.txt`
-- `pyproject.toml`
+- source: `fleet_manager/`, `ha_update_dashboard/`
+- tests: `tests/`
+- deployment examples: `deploy/`, `Dockerfile`, `docker-compose.yml`
+- docs: `README.md`, `SETUP.md`, `DEPLOYMENT.md`, `DOCKER.md`, `SECURITY.md`, `ARCHITECTURE.md`
+- config examples: `.env.example`, `.gitignore`, `.dockerignore`, `requirements.txt`, `pyproject.toml`
 
 ## Exclude
 
 - `.env`, `.env.local`, and real env files
 - `config.local.json`
 - `data/`
-- SQLite DBs
+- SQLite databases
 - logs
 - `.venv/`
 - `.pytest_cache/`
 - `hafm-test-*/`
-- personal domains and local IPs
-- real Home Assistant tokens
-- OAuth client IDs/secrets
-- personal/family/property names
-- generated screenshots that show real environments
+- real domains, local IPs, emails, tokens, OAuth IDs/secrets, property names, or live screenshots
 
-## Required scans
+## Required checks
 
 ```bash
 git status --short
@@ -48,8 +30,8 @@ python -m compileall fleet_manager ha_update_dashboard tests
 pytest -q
 ```
 
-Privacy scan terms should include project-specific private terms plus common sensitive markers: personal domains, local IP ranges, operator emails, OAuth client IDs, Home Assistant tokens, and runtime SQLite data.
+Run a privacy scan for private domains, local IP ranges, real operator emails, OAuth IDs, Home Assistant tokens, SQLite files, and generated runtime state.
 
 ## Branch policy
 
-Publish work to `dev` first. Merge to `main` only after tests pass, privacy scan passes, runtime state is excluded, docs match actual behavior, and remote branch tip is verified after push.
+Push to `dev` first. Merge to `main` only after tests pass, the privacy scan is clean, docs match current behavior, and the remote tip is verified.

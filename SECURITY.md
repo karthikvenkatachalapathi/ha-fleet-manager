@@ -1,4 +1,4 @@
-# Security Guide
+# Security
 
 ## Trust boundary
 
@@ -6,45 +6,48 @@
 Browser -> Fleet Manager API -> encrypted credential service -> Home Assistant API
 ```
 
-The browser never receives stored Home Assistant tokens. Existing tokens are never rendered back to the UI.
+Stored Home Assistant tokens stay on the server. The UI never renders them back after save.
 
 ## Credential storage
 
-Home Assistant tokens are encrypted at rest using AES-256-GCM. The encryption key is supplied by `MASTER_ENCRYPTION_KEY` and is not stored in the database.
+Home Assistant tokens are encrypted with AES-256-GCM. `MASTER_ENCRYPTION_KEY` supplies the key and is not stored in the database.
 
-Back up the database and the master key source together, but never in the same public Git repository.
+Back up the database and key source together. Do not put either one in a public repo.
 
-## URL safety controls
+## URL and proxy controls
 
-Fleet Manager rejects non-HTTP(S) instance URLs, URLs with embedded credentials, and caller-controlled proxy paths. The Home Assistant adapter owns the API paths and disables ambient proxy/redirect behavior where credential leakage would be risky.
+Fleet Manager rejects instance URLs that are not HTTP(S), rejects URLs with embedded credentials, and does not expose a generic proxy endpoint. Home Assistant API paths are chosen by the backend, not by the browser.
+
+The Home Assistant adapter does not follow redirects when sending credentials.
 
 ## Session security
 
 - Argon2 password hashing
 - server-side sessions
 - HttpOnly SameSite cookies
-- CSRF token header for mutating requests
-- audit events for login/logout/failure and sensitive actions
+- CSRF header for mutating requests
+- audit events for login, logout, failure, and sensitive actions
+- optional OIDC login for admin access
 
-Use HTTPS in production so cookies are protected in transit.
+Use HTTPS in production.
 
-## Sensitive files that must not be committed
+## Do not commit
 
-- `.env`, `.env.local`, `.env.*` except `.env.example`
+- `.env`, `.env.local`, or real env files
 - `config.local.json`
 - `data/`
 - `*.db`, `*.sqlite`, `*.sqlite3`
-- logs and generated test/runtime directories
-- real Home Assistant URLs/tokens
-- OAuth client IDs/secrets
-- personal domains, personal emails, local IPs, family/property names
+- logs and generated runtime/test folders
+- real Home Assistant URLs or tokens
+- OAuth client IDs or secrets
+- personal domains, personal emails, local IPs, family names, or property names
 
 ## Token rotation
 
-Rotate a Home Assistant token when an operator leaves, a runtime host is suspected of exposure, backup custody is uncertain, or a token was pasted into the wrong system.
+Rotate a Home Assistant token when an operator leaves, a host may have been exposed, backup custody is uncertain, or a token was pasted into the wrong place.
 
-Replace the token through **Settings → Instance config → Edit Instance**. Leaving the token field blank preserves the existing encrypted token.
+Replace the token in **Settings → Instance config → Edit Instance**. Leaving the token field blank keeps the existing encrypted token.
 
-## Public issue reports
+## Public bug reports
 
-Redact instance names, domains, local IPs, tokens, secrets, email addresses, audit rows containing personal environment details, and raw SQLite data.
+Redact instance names, domains, local IPs, tokens, email addresses, audit rows with private environment details, and raw SQLite data.

@@ -90,10 +90,8 @@ class HomeAssistantAdapter:
             r.raise_for_status()
             return r.json()
 
-    def post(self, path: str, payload: dict):
-        if not path.startswith('/api/services/'):
-            raise ValueError('Only Home Assistant service API paths are allowed for POST')
-        with httpx.Client(follow_redirects=False, timeout=12, verify=True, trust_env=False) as client:
+    def _post_allowed(self, path: str, payload: dict, *, timeout: int = 12):
+        with httpx.Client(follow_redirects=False, timeout=timeout, verify=True, trust_env=False) as client:
             r=client.post(self.base+path, headers=self._headers(), json=payload)
             if 300 <= r.status_code < 400:
                 raise RuntimeError('Redirects are not followed to protect credentials')
@@ -101,6 +99,16 @@ class HomeAssistantAdapter:
                 raise PermissionError('Authentication failed')
             r.raise_for_status()
             return r.json() if r.text else {}
+
+    def post(self, path: str, payload: dict):
+        if not (path.startswith('/api/services/') or path.startswith('/api/events/')):
+            raise ValueError('Only Home Assistant service or event API paths are allowed for POST')
+        return self._post_allowed(path, payload)
+
+    def supervisor_post(self, path: str, payload: dict | None = None):
+        if not path.startswith('/api/hassio/'):
+            raise ValueError('Only Home Assistant Supervisor API paths are allowed for supervisor POST')
+        return self._post_allowed(path, payload or {}, timeout=20)
 
     def test_connection(self) -> dict:
         cfg=self.get('/api/config')
@@ -137,6 +145,21 @@ class HomeAssistantAdapter:
         # Fire the canonical shutdown event first so user automations listening for
         # Home Assistant shutdown still run before the host goes down.
         return self.fire_event('homeassistant_stop', {'source': 'fleet_manager', 'reason': reason})
+
+    def host_reboot(self) -> dict:
+        attempts: list[dict] = []
+        for endpoint, supervisor in [
+            ('/api/hassio/host/reboot', True),
+            ('/api/services/hassio/host_reboot', False),
+            ('/api/services/hassio/host_reboot_full', False),
+        ]:
+            try:
+                response = self.supervisor_post(endpoint, {}) if supervisor else self.post(endpoint, {})
+                attempts.append({'endpoint': endpoint, 'ok': True})
+                return {'ok': True, 'endpoint': endpoint, 'response': response, 'attempts': attempts}
+            except Exception as exc:
+                attempts.append({'endpoint': endpoint, 'ok': False, 'error': type(exc).__name__, 'message': str(exc)[:240]})
+        raise RuntimeError('Host reboot failed via all known Home Assistant/Supervisor endpoints: ' + json.dumps(attempts))
 
     def list_repairs(self) -> list[dict]:
         result = self.websocket_command('repairs/list_issues') or {}

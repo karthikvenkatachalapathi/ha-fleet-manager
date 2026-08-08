@@ -1,16 +1,16 @@
-# Deployment Guide
+# Deployment
 
-## Recommended production topology
+Recommended production shape:
 
 ```text
 browser -> HTTPS reverse proxy -> Fleet Manager -> Home Assistant instances
 ```
 
-Use the reverse proxy for TLS, public DNS, access controls, and secure cookies. Keep Fleet Manager bound to `127.0.0.1` when possible.
+Keep Fleet Manager bound to localhost or a private interface when you can. Let the reverse proxy handle TLS and access controls.
 
-## Native systemd deployment
+## Native systemd install
 
-Example target path: `/opt/ha-fleet-manager`.
+Example path: `/opt/ha-fleet-manager`.
 
 ```bash
 sudo mkdir -p /opt/ha-fleet-manager
@@ -23,9 +23,9 @@ pip install -r requirements.txt
 cp .env.example .env.local
 ```
 
-Create secrets as described in [SETUP.md](SETUP.md).
+Generate and edit secrets as shown in [SETUP.md](SETUP.md).
 
-Install user service example:
+Install the user service example:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -34,7 +34,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now home-assistant-fleet-manager.service
 ```
 
-Check:
+Check it:
 
 ```bash
 systemctl --user status home-assistant-fleet-manager.service
@@ -43,9 +43,7 @@ curl -fsS http://127.0.0.1:8799/health/ready
 
 ## Reverse proxy
 
-See `deploy/reverse-proxy.md` for a generic Nginx-style example.
-
-Minimum headers:
+See [deploy/reverse-proxy.md](deploy/reverse-proxy.md). At minimum, pass these headers:
 
 ```nginx
 proxy_set_header Host $host;
@@ -54,7 +52,7 @@ proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto $scheme;
 ```
 
-## Upgrades
+## Upgrade
 
 ```bash
 cd /opt/ha-fleet-manager
@@ -68,9 +66,17 @@ systemctl --user restart home-assistant-fleet-manager.service
 curl -fsS http://127.0.0.1:8799/health/ready
 ```
 
-## Backups
+## Backup
 
-Back up runtime database, encrypted credential rows, `.env.local` or secret-manager values, and reverse-proxy configuration. The encrypted database is not enough by itself; the matching `MASTER_ENCRYPTION_KEY` is required for recovery.
+Back up:
+
+- runtime database
+- `MASTER_ENCRYPTION_KEY`
+- `SESSION_SECRET`
+- reverse proxy config
+- service unit overrides
+
+The database by itself is not enough. You need the matching encryption key to recover stored Home Assistant tokens.
 
 ## Rollback
 
@@ -86,10 +92,11 @@ curl -fsS http://127.0.0.1:8799/health/ready
 
 ## Hardening checklist
 
-- [ ] Serve through HTTPS.
-- [ ] Restrict UI access to trusted networks/users.
-- [ ] Use strong admin password or OIDC.
-- [ ] Store `.env.local` outside Git and back it up securely.
+- [ ] Use HTTPS.
+- [ ] Restrict the UI to trusted operators.
+- [ ] Use a strong admin password or OIDC.
+- [ ] Keep `.env.local` out of Git.
+- [ ] Back up the database and encryption key.
 - [ ] Monitor `/health/ready`.
-- [ ] Alert on failed sync, failed backups, failed update operations, and auth failures.
-- [ ] Rotate Home Assistant tokens when operator or host custody changes.
+- [ ] Alert on failed sync, backup, update, and auth events.
+- [ ] Rotate Home Assistant tokens when custody changes.

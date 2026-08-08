@@ -7,7 +7,7 @@ os.environ['FLEET_ADMIN_PASSWORD'] = 'test-password'
 os.environ['DATABASE_URL'] = 'sqlite:///' + str(Path(tempfile.mkdtemp(prefix='hafm-test-')) / 'test.db')
 
 from fleet_manager.db import Base, engine, SessionLocal
-from fleet_manager.models import Instance, UpdateRecord, Notification, User
+from fleet_manager.models import Instance, UpdateRecord, Notification, User, AuditEvent
 from fleet_manager.services.credentials import CredentialService
 from fleet_manager.services.automation import review_update_for_auto, monitor_and_act, install_update
 from fleet_manager.services.release_parser import parse_breaking_sections
@@ -143,6 +143,10 @@ def test_fleet_manager_ui_has_unrestricted_update_actions_and_oidc_settings():
     assert '<th>Status</th><th>Actions</th>' not in html
     assert 'deleteInstance' in html
     assert 'bulkButton' in html
+    assert 'data-label=\"Update\"' in html
+    assert 'selectCell' in html
+    assert 'overflow-x:hidden!important' in html
+    assert 'width:14px!important' in html
     assert 'manual only' not in html.lower()
     assert 'No JSON editing required' not in html
 
@@ -260,3 +264,213 @@ def test_delete_instance_endpoint_removes_configuration():
     assert db.get(Instance, inst_id) is None
     assert db.query(UpdateRecord).filter_by(instance_id=inst_id).count() == 0
     db.close()
+
+
+def test_adapter_allows_event_post_for_repair_shutdown(monkeypatch):
+    from fleet_manager.services.ha_adapter import HomeAssistantAdapter
+    inst = Instance(friendly_name='EventHA', url='http://ha.local')
+    monkeypatch.setattr('fleet_manager.services.ha_adapter.resolve_host', lambda host: ['127.0.0.1'])
+    calls = []
+    class FakeResponse:
+        status_code = 200
+        text = '{}'
+        def raise_for_status(self): pass
+        def json(self): return {}
+    class FakeClient:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def post(self, url, headers=None, json=None):
+            calls.append((url, json)); return FakeResponse()
+    monkeypatch.setattr('fleet_manager.services.ha_adapter.httpx.Client', FakeClient)
+    HomeAssistantAdapter(inst, 'token').trigger_shutdown_automations('host_reboot')
+    assert calls == [('http://ha.local/api/events/homeassistant_stop', {'source': 'fleet_manager', 'reason': 'host_reboot'})]
+
+
+def test_instance_backup_prefers_modern_backup_service(monkeypatch):
+    db = SessionLocal()
+    inst = Instance(friendly_name='ModernBackup', url='http://ha.local')
+    db.add(inst); db.commit()
+    calls = []
+    class FakeCreds:
+        def get_instance_token(self, db_, instance_id): return 'token'
+    class FakeAdapter:
+        def __init__(self, instance, token): pass
+        def post(self, path, payload):
+            calls.append((path, payload.copy()))
+            return {'slug': 'abc123'}
+    import fleet_manager.services.automation as automod
+    monkeypatch.setattr(automod, 'CredentialService', FakeCreds)
+    monkeypatch.setattr(automod, 'HomeAssistantAdapter', FakeAdapter)
+    monkeypatch.setattr(automod, 'append_vault_update_log', lambda *a, **k: None)
+    rec = automod.create_instance_backup(db, inst, actor='test')
+    assert rec.status == 'completed'
+    assert rec.backup_id == 'abc123'
+    assert calls[0][0] == '/api/services/backup/create'
+    db.close()
+
+
+def test_ui_audit_headers_and_bottom_menu_icons():
+    html = Path(__file__).resolve().parents[1].joinpath('fleet_manager/static/index.html').read_text()
+    assert "x-fleet-page" in html
+    assert "x-fleet-menu" in html
+    assert 'class="topActions"' in html
+    assert 'onclick="syncAll()" title="Refresh"' in html
+    assert 'class="iconBtn logoutIcon"' in html
+    assert '<svg viewBox="0 0 32 32" aria-hidden="true"' in html
+    assert 'class="door"' in html
+
+
+def test_ui_mutating_request_is_audited_with_page_header():
+    from fleet_manager.app import app, create_session
+    db = SessionLocal()
+    user = User(email='audit-admin@example.local', username='audit-admin', password_hash='x', role='admin')
+    db.add(user); db.flush()
+    sess = create_session(db, user); db.commit()
+    client = TestClient(app)
+    r = client.post('/api/notifications/ack', json={'ids': []}, cookies={'hafm_session': sess.id}, headers={'x-csrf-token': sess.csrf_token, 'x-fleet-page': 'Recent activity', 'x-fleet-menu': 'Recent activity'})
+    assert r.status_code == 200
+    db.expire_all()
+    row = db.query(AuditEvent).filter_by(action='ui_api_action', resource_id='/api/notifications/ack').order_by(AuditEvent.id.desc()).first()
+    assert row is not None
+    assert 'Recent activity' in row.metadata_json
+    db.close()
+
+
+def test_host_reboot_uses_supervisor_endpoint_before_legacy_service(monkeypatch):
+    from fleet_manager.services.ha_adapter import HomeAssistantAdapter
+    inst = Instance(friendly_name='RebootHA', url='http://ha.local')
+    monkeypatch.setattr('fleet_manager.services.ha_adapter.resolve_host', lambda host: ['127.0.0.1'])
+    calls = []
+    class FakeResponse:
+        status_code = 200
+        text = '{"ok":true}'
+        def raise_for_status(self): pass
+        def json(self): return {'ok': True}
+    class FakeClient:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def post(self, url, headers=None, json=None):
+            calls.append((url, json)); return FakeResponse()
+    monkeypatch.setattr('fleet_manager.services.ha_adapter.httpx.Client', FakeClient)
+    result = HomeAssistantAdapter(inst, 'token').host_reboot()
+    assert result['endpoint'] == '/api/hassio/host/reboot'
+    assert calls == [('http://ha.local/api/hassio/host/reboot', {})]
+
+
+def test_restart_request_marks_instance_restarting(monkeypatch):
+    from fleet_manager.app import app, create_session
+    db = SessionLocal()
+    user = User(email='restart-admin@example.local', username='restart-admin', password_hash='x', role='admin')
+    inst = Instance(friendly_name='RestartMe', url='http://restart-me.local', connectivity_state='online', health_state='healthy')
+    db.add_all([user, inst]); db.flush()
+    inst_id = inst.id
+    CredentialService().set_instance_token(db, inst.id, 'restart-token-value')
+    sess = create_session(db, user); db.commit()
+    class FakeAdapter:
+        def __init__(self, instance, token): pass
+        def post(self, path, payload): return {'ok': True}
+    monkeypatch.setattr('fleet_manager.app.HomeAssistantAdapter', FakeAdapter)
+    client = TestClient(app)
+    r = client.post(f'/api/instances/{inst_id}/restart', cookies={'hafm_session': sess.id}, headers={'x-csrf-token': sess.csrf_token})
+    assert r.status_code == 200
+    assert r.json()['state'] == 'restarting'
+    db.expire_all()
+    row = db.get(Instance, inst_id)
+    assert row.connectivity_state == 'restarting'
+    assert row.health_state == 'restarting'
+    db.close()
+
+
+def test_repair_reboot_marks_instance_restarting(monkeypatch):
+    from fleet_manager.app import app, create_session
+    db = SessionLocal()
+    user = User(email='repair-restart-admin@example.local', username='repair-restart-admin', password_hash='x', role='admin')
+    inst = Instance(friendly_name='RepairRestart', url='http://repair-restart.local', connectivity_state='online', health_state='healthy')
+    db.add_all([user, inst]); db.flush()
+    inst_id = inst.id
+    CredentialService().set_instance_token(db, inst.id, 'repair-restart-token-value')
+    sess = create_session(db, user); db.commit()
+    class FakeAdapter:
+        def __init__(self, instance, token): pass
+        def trigger_shutdown_automations(self, reason): return {'ok': True}
+        def host_reboot(self): return {'endpoint': '/api/hassio/host/reboot', 'attempts': []}
+    monkeypatch.setattr('fleet_manager.app.HomeAssistantAdapter', FakeAdapter)
+    monkeypatch.setattr('fleet_manager.app.time.sleep', lambda *_: None)
+    client = TestClient(app)
+    r = client.post('/api/repairs/fix', json={'instance_id': inst_id, 'domain': 'hassio', 'issue_id': 'system_reboot_required', 'action': 'host_reboot'}, cookies={'hafm_session': sess.id}, headers={'x-csrf-token': sess.csrf_token})
+    assert r.status_code == 200
+    db.expire_all()
+    row = db.get(Instance, inst_id)
+    assert row.connectivity_state == 'restarting'
+    assert row.health_state == 'restarting'
+    db.close()
+
+
+def test_ui_mobile_responsive_css_present():
+    html = Path(__file__).resolve().parents[1].joinpath('fleet_manager/static/index.html').read_text()
+    assert '@media (max-width: 760px)' in html
+    assert 'position:fixed;left:0;right:0;bottom:0' in html
+    assert 'height:calc(58px + env(safe-area-inset-bottom))' in html
+    assert 'overflow-x:auto;-webkit-overflow-scrolling:touch' in html
+    assert '.drawer{inset:0;width:100%;max-width:none' in html
+    assert 'min-height:42px' in html
+
+
+def test_ui_fast_initial_load_and_pwa_assets_present():
+    root = Path(__file__).resolve().parents[1]
+    html = root.joinpath('fleet_manager/static/index.html').read_text()
+    manifest = root.joinpath('fleet_manager/static/manifest.webmanifest').read_text()
+    sw = root.joinpath('fleet_manager/static/sw.js').read_text()
+    assert '<link rel="manifest" href="/manifest.webmanifest">' in html
+    assert 'mobile-web-app-capable' in html
+    assert "navigator.serviceWorker.register('/sw.js')" in html
+    assert "const basePages=['Updates','Repairs','Recent activity','Settings'];" in html
+    assert "async function loadCore(){let [instances,updates]=await Promise.all([api('/api/instances'),api('/api/updates')]);" in html
+    assert "api('/api/repairs')" in html
+    assert 'Loading repairs…' in html
+    assert 'display": "standalone"' in manifest
+    assert 'start_url": "/"' in manifest
+    assert "if (url.pathname.startsWith('/api/')) return;" in sw
+
+
+def test_pwa_routes_served():
+    from fleet_manager.app import app
+    client = TestClient(app)
+    manifest = client.get('/manifest.webmanifest')
+    assert manifest.status_code == 200
+    assert manifest.json()['display'] == 'standalone'
+    sw = client.get('/sw.js')
+    assert sw.status_code == 200
+    assert 'Service-Worker-Allowed' in sw.headers
+    assert "ha-fleet-manager-v3" in sw.text
+
+
+def test_mobile_nav_and_metrics_are_compact():
+    html = Path(__file__).resolve().parents[1].joinpath('fleet_manager/static/index.html').read_text()
+    assert 'height:calc(58px + env(safe-area-inset-bottom))' in html
+    assert '.navLabel{display:none}' in html
+    assert 'grid-auto-columns:1fr' in html
+    assert '.metric{padding:8px 10px;border-radius:10px;min-height:58px}' in html
+    assert '.metric b{font-size:24px;line-height:1.05}' in html
+    assert 'grid-template-columns:repeat(2,minmax(0,1fr));gap:7px' in html
+
+
+def test_mobile_bottom_bar_hides_logo_and_controls():
+    html = Path(__file__).resolve().parents[1].joinpath('fleet_manager/static/index.html').read_text()
+    sw = Path(__file__).resolve().parents[1].joinpath('fleet_manager/static/sw.js').read_text()
+    assert 'nav .brand,.app:not(.expanded) nav .brand,.app.expanded nav .brand{display:none!important}' in html
+    assert '.navControls{display:none!important}' in html
+    assert 'grid-template-columns:1fr;gap:0' in html
+    assert "ha-fleet-manager-v3" in sw
+
+
+def test_mobile_logo_moves_to_content_header_not_bottom_nav():
+    root = Path(__file__).resolve().parents[1]
+    html = root.joinpath('fleet_manager/static/index.html').read_text()
+    sw = root.joinpath('fleet_manager/static/sw.js').read_text()
+    assert 'class="mobileTopLogo"' in html
+    assert '.mobileTopLogo{display:block;flex:0 0 34px}' in html
+    assert 'nav .brand,.app:not(.expanded) nav .brand,.app.expanded nav .brand{display:none!important}' in html
+    assert 'ha-fleet-manager-v3' in sw

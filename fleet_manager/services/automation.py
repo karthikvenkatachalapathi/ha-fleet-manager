@@ -336,13 +336,23 @@ def create_instance_backup(db: Session, inst: Instance, *, actor: str = 'user') 
     details = {'actor': actor, 'attempts': []}
     try:
         response = None
-        try:
-            response = adapter.post('/api/services/hassio/backup_full', {'name': rec.name, 'compressed': True})
-            details['attempts'].append({'endpoint': '/api/services/hassio/backup_full', 'ok': True})
-        except Exception as exc:
-            details['attempts'].append({'endpoint': '/api/services/hassio/backup_full', 'ok': False, 'error': type(exc).__name__, 'message': str(exc)[:240]})
-            response = adapter.post('/api/services/backup/create_automatic', {})
-            details['attempts'].append({'endpoint': '/api/services/backup/create_automatic', 'ok': True})
+        backup_attempts = [
+            ('/api/services/backup/create', {'name': rec.name}),
+            ('/api/services/backup/create_automatic', {}),
+            ('/api/services/hassio/backup_full', {'name': rec.name, 'compressed': True}),
+        ]
+        last_error: Exception | None = None
+        for endpoint, payload in backup_attempts:
+            try:
+                response = adapter.post(endpoint, payload)
+                details['attempts'].append({'endpoint': endpoint, 'ok': True})
+                break
+            except Exception as exc:
+                last_error = exc
+                details['attempts'].append({'endpoint': endpoint, 'ok': False, 'error': type(exc).__name__, 'message': str(exc)[:240]})
+        else:
+            assert last_error is not None
+            raise last_error
         rec.status = 'completed'; rec.completed_at = now()
         rec.backup_id = str((response or {}).get('slug') or (response or {}).get('backup_id') or '') or None
         inst.last_successful_backup = rec.completed_at; inst.backup_compliance_state = 'current'

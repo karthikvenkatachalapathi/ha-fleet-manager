@@ -1,74 +1,71 @@
 # Architecture
 
-## System shape
+Fleet Manager is a narrow admin control plane for Home Assistant fleets.
 
 ```text
-Browser UI
-  -> FastAPI Fleet Manager backend
+Browser
+  -> FastAPI Fleet Manager
     -> SQLAlchemy database
-    -> CredentialService
+    -> encrypted credential service
     -> HomeAssistantAdapter
-      -> configured Home Assistant instance APIs
+      -> configured Home Assistant instances
 ```
 
-Fleet Manager is a narrow control plane. It is not a generic reverse proxy and does not expose arbitrary Home Assistant API forwarding.
+It is not a generic Home Assistant proxy. The backend owns the Home Assistant API paths and the browser only receives sanitized data.
 
 ## Main components
 
 | Component | Role |
 |---|---|
 | `fleet_manager/app.py` | FastAPI app, auth, UI/API routes |
-| `fleet_manager/models.py` | SQLAlchemy data model |
-| `fleet_manager/services/credentials.py` | encrypted token custody |
-| `fleet_manager/services/ha_adapter.py` | Home Assistant REST/WebSocket/service interactions |
-| `fleet_manager/services/automation.py` | deterministic monitor/automation worker |
-| `fleet_manager/static/index.html` | single-file operator console |
-| `ha_update_dashboard/` | legacy read-only dashboard prototype retained for lineage |
+| `fleet_manager/models.py` | SQLAlchemy models |
+| `fleet_manager/services/credentials.py` | encrypted token storage |
+| `fleet_manager/services/ha_adapter.py` | Home Assistant REST/WebSocket/service calls |
+| `fleet_manager/services/automation.py` | monitor, backup, update, skip, policy logic |
+| `fleet_manager/static/index.html` | operator UI |
+| `ha_update_dashboard/` | older read-only prototype kept for reference |
 
 ## Data model
 
-Core tables include users, sessions, instances, instance credentials, update records, approvals, notifications, operations, backups, job runs, audit events, and policy/application settings.
+The app stores users, sessions, instances, encrypted credentials, update records, approvals, notifications, operations, backups, job runs, audit events, policy settings, and schedules.
 
-## Request flow: update inventory
+SQLite works for a small self-hosted install. A larger fleet should move to a managed database and migrations.
 
-1. Operator opens **Updates**.
-2. UI fetches core data in parallel: instances, updates, repairs.
-3. Backend returns sanitized domain models.
-4. UI filters out current/same-version updates and shows pending count badge.
+## Request flows
 
-## Request flow: add instance
+### Add instance
 
-1. Operator enters Home Assistant URL and long-lived access token.
-2. Backend validates URL shape.
-3. Backend calls Home Assistant server-side.
-4. If valid, token is encrypted and stored.
-5. Browser never sees the stored token again.
+1. Admin enters the Home Assistant URL and long-lived token.
+2. Backend validates the URL.
+3. Backend calls Home Assistant with the supplied token.
+4. If validation works, Fleet Manager encrypts and stores the token.
+5. Existing tokens are never shown back to the browser.
 
-## Request flow: update execution
+### Update inventory
 
-1. Operator confirms update.
-2. Backend preflights exact entity/target version.
-3. Backend calls `update.install` with safe payload.
-4. Backend polls after transient failures when the update may restart an add-on/tunnel.
-5. Operation and audit records capture outcome.
-6. UI refreshes normalized update state.
+1. UI requests instances, updates, and repairs.
+2. Backend normalizes `update.*` entities.
+3. Rows where current and available versions match are hidden.
+4. The UI shows the remaining actionable updates.
 
-## Request flow: repair reboot
+### Update or skip
 
-1. Backend reads HA repair issues through WebSocket repair issue listing.
-2. UI shows only known safe native action when Fleet Manager recognizes it.
-3. Reboot action fires a HA shutdown event first, waits briefly, then calls Supervisor host reboot.
-4. If no known native action exists, UI links to Home Assistant repairs instead of guessing.
+1. Admin confirms the action in the UI.
+2. Backend checks the update entity and target version.
+3. For update, Fleet Manager tries a native Home Assistant backup path when available, then calls `update.install`.
+4. For skip, Fleet Manager calls `update.skip` for the entity.
+5. Operation and audit records capture the result.
 
-## Performance model
+### Backup and restart
 
-Initial load fetches only instances, updates, and repairs. Recent activity and Settings lazy-load their own secondary data.
+Instance backup uses Home Assistant backup services in the safest known order for the instance. Restart and repair reboot actions are audited and mark the instance as restarting so the UI does not look idle while Home Assistant is going down.
 
 ## Security invariants
 
 - No generic proxy endpoint.
-- Browser receives sanitized models only.
+- No stored Home Assistant token is sent to the browser.
 - Tokens are encrypted at rest.
-- Runtime master key is injected through environment/secrets.
-- High-risk update classes default to manual-required.
-- Sensitive actions are confirmation-gated and audited.
+- The master key comes from the runtime environment or secret manager.
+- Mutating API calls require CSRF protection.
+- Sensitive actions are confirmed and audited.
+- The adapter does not follow redirects with credentials.

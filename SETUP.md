@@ -1,34 +1,28 @@
-# Setup Guide
+# Setup
 
-This guide separates one-time installation from day-2 UI administration.
+This is the local install path. Use [DOCKER.md](DOCKER.md) if you want to run it in a container.
 
 ## Requirements
 
 - Python 3.12+
-- Linux, macOS, or a container host
 - Network access from Fleet Manager to each Home Assistant instance
-- A Home Assistant long-lived access token per managed instance
-- TLS reverse proxy for production browser access
+- One Home Assistant long-lived access token per instance
+- TLS reverse proxy for production use
 
-## Clone
+## Install
 
 ```bash
 git clone https://github.com/<owner>/ha-fleet-manager.git
 cd ha-fleet-manager
-```
-
-## Python environment
-
-```bash
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env.local
 ```
 
-## Runtime secrets
+Generate the two required secrets:
 
 ```bash
-cp .env.example .env.local
 python - <<'PY'
 import base64, os, secrets
 print('MASTER_ENCRYPTION_KEY=' + base64.urlsafe_b64encode(os.urandom(32)).decode())
@@ -47,7 +41,7 @@ FLEET_ADMIN_PASSWORD=<initial-password>
 APP_TIMEZONE=UTC
 ```
 
-## Start locally
+## Run locally
 
 ```bash
 set -a && . ./.env.local && set +a
@@ -58,20 +52,16 @@ Open `http://127.0.0.1:8799`.
 
 ## First login
 
-Use `FLEET_ADMIN_EMAIL` and `FLEET_ADMIN_PASSWORD`, then change account settings in the UI.
+Sign in with `FLEET_ADMIN_EMAIL` and `FLEET_ADMIN_PASSWORD`. Change the password in **Settings → Account**.
+
+Optional OIDC login is configured in **Settings → OIDC**. Keep password login available until OIDC works end to end.
 
 ## Add instances
 
 1. Go to **Settings → Instance config**.
 2. Click **Add Instance**.
-3. Enter a friendly name, URL, environment, and long-lived Home Assistant token.
-4. Fleet Manager validates the token and stores it encrypted.
-
-## Day-2 operations
-
-Use the UI for adding/editing/deleting instances, OIDC configuration, account settings, update review, repair review, backups/restarts, and notification acknowledgement.
-
-Do not edit runtime SQLite data directly unless performing recovery.
+3. Enter a name, URL, environment, and long-lived Home Assistant token.
+4. Save. Fleet Manager validates the token before storing it.
 
 ## Verify
 
@@ -80,3 +70,7 @@ curl -fsS http://127.0.0.1:8799/health/live
 curl -fsS http://127.0.0.1:8799/health/ready
 pytest -q
 ```
+
+## Backup reminder
+
+Back up the database and the secret source that contains `MASTER_ENCRYPTION_KEY`. You need both to restore encrypted instance tokens.
