@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/hermes/ha-update-dashboard
-EnvironmentFile=/home/hermes/ha-update-dashboard/.env.local
-ExecStart=/home/hermes/ha-update-dashboard/.venv/bin/uvicorn fleet_manager.app:app --host 0.0.0.0 --port 8799
+WorkingDirectory=/opt/ha-fleet-manager
+EnvironmentFile=/opt/ha-fleet-manager/.env.local
+ExecStart=/opt/ha-fleet-manager/.venv/bin/uvicorn fleet_manager.app:app --host 0.0.0.0 --port 8799
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

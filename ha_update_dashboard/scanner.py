@@ -15,11 +15,11 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-USER_AGENT = os.environ.get("HA_UPDATE_DASHBOARD_USER_AGENT", "Hermes-HA-Update-Dashboard/0.1")
-VAULT = os.environ.get("AGENT_VAULT_VAULT", "hermes")
-AV_ADDR = os.environ.get("AGENT_VAULT_ADDR", "http://192.168.2.7:14321").rstrip("/")
-AV_TOKEN_FILE = os.environ.get("AGENT_VAULT_TOKEN_FILE", "/home/hermes/.config/secrets/agent-vault/shared.token")
-CONFIG_PATH = Path(os.environ.get("HA_UPDATE_DASHBOARD_CONFIG", "/home/hermes/ha-update-dashboard/config.local.json"))
+USER_AGENT = os.environ.get("HA_UPDATE_DASHBOARD_USER_AGENT", "HA-Update-Dashboard/0.1")
+VAULT = os.environ.get("AGENT_VAULT_VAULT", "default")
+AV_ADDR = os.environ.get("AGENT_VAULT_ADDR", "http://127.0.0.1:14321").rstrip("/")
+AV_TOKEN_FILE = os.environ.get("AGENT_VAULT_TOKEN_FILE", "/run/secrets/agent-vault-token")
+CONFIG_PATH = Path(os.environ.get("HA_UPDATE_DASHBOARD_CONFIG", "config.local.json"))
 
 EXCLUDED_ENTITY_IDS = {
     "update.home_assistant_core_update",

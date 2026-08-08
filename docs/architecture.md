@@ -30,7 +30,7 @@ Live limitations / safety notes:
 
 - Release notes may be only a URL, not structured release content.
 - Breaking-change detection cannot be guaranteed from entity metadata alone.
-- Home Assistant Core / HAOS updates remain manual-notify for Karthik's fleet policy.
+- Home Assistant Core / HAOS updates remain manual-notify for the configured fleet policy.
 - Backups/restore capabilities vary by installation type and Supervisor availability; they must be capability-detected before use.
 - Automatic rollback is not promised. Restore must remain explicit human action.
 
@@ -204,7 +204,7 @@ Reserved states:
 - Schedule records.
 - Backup record table scaffold.
 - Deterministic automation worker CLI.
-- Hermes cron wrapper scheduled every 6 hours.
+- Optional external scheduler invokes the automation CLI on the configured cadence.
 - Low-risk update execution path using `update.install` only after release-note review.
 - Automatic exclusion for Core, HAOS, Supervisor, firmware, router, Zigbee, Z-Wave, Matter, and Thread classes.
 - Vault documentation append for each successful install.

@@ -1,9 +1,29 @@
+# Python/runtime
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+
+# Local secrets/config/state
 .env
-.env.local
+.env.*
+!.env.example
 config.local.json
-run.log
 data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs/temp/artifacts
+*.log
+run.log
+hafm-test-*/
+tmp/
+cache/
+backups/
+uploads/
+
+# Local editor/OS
+.DS_Store
+.idea/
+.vscode/

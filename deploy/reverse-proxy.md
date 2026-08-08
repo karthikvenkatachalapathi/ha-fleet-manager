@@ -3,13 +3,13 @@
 Recommended public/internal hostname:
 
 ```text
-ha-fleet.karthikvenkat.us
+fleet-manager.example.com
 ```
 
 Backend target:
 
 ```text
-http://192.168.2.107:8799
+http://127.0.0.1:8799
 ```
 
 Current app cookie is `HttpOnly` + `SameSite=Lax`. Enable TLS at the reverse proxy. If exposing beyond LAN/Tailscale, place behind Authentik or IP allowlist.

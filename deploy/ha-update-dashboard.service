@@ -4,9 +4,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/hermes/ha-update-dashboard
+WorkingDirectory=/opt/ha-fleet-manager
 Environment=PYTHONUNBUFFERED=1
-Environment=HA_UPDATE_DASHBOARD_CONFIG=/home/hermes/ha-update-dashboard/config.local.json
+Environment=HA_UPDATE_DASHBOARD_CONFIG=/opt/ha-fleet-manager/config.local.json
 ExecStart=/usr/bin/python3 -m ha_update_dashboard.server --host 0.0.0.0 --port 8799
 Restart=on-failure
 RestartSec=5

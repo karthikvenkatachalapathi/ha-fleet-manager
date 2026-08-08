@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from html import unescape
 from urllib.parse import urlparse
 import httpx
+from websockets.sync.client import connect
 from sqlalchemy.orm import Session
 from ..models import Instance, UpdateRecord, now
 
@@ -92,7 +93,7 @@ class HomeAssistantAdapter:
     def post(self, path: str, payload: dict):
         if not path.startswith('/api/services/'):
             raise ValueError('Only Home Assistant service API paths are allowed for POST')
-        with httpx.Client(follow_redirects=False, timeout=60, verify=True, trust_env=False) as client:
+        with httpx.Client(follow_redirects=False, timeout=12, verify=True, trust_env=False) as client:
             r=client.post(self.base+path, headers=self._headers(), json=payload)
             if 300 <= r.status_code < 400:
                 raise RuntimeError('Redirects are not followed to protect credentials')
@@ -106,6 +107,45 @@ class HomeAssistantAdapter:
         states=self.get('/api/states')
         return {'config': cfg, 'state_count': len(states)}
 
+    def websocket_command(self, command_type: str, payload: dict | None = None, *, timeout: int = 15):
+        parsed = urlparse(self.base)
+        scheme = 'wss' if parsed.scheme == 'https' else 'ws'
+        url = f'{scheme}://{parsed.netloc}/api/websocket'
+        with connect(url, open_timeout=timeout, close_timeout=2) as ws:
+            hello = json.loads(ws.recv())
+            if hello.get('type') != 'auth_required':
+                raise RuntimeError('Unexpected Home Assistant websocket handshake')
+            ws.send(json.dumps({'type': 'auth', 'access_token': self.token}))
+            auth = json.loads(ws.recv())
+            if auth.get('type') != 'auth_ok':
+                raise PermissionError('Home Assistant websocket authentication failed')
+            command = {'id': 1, 'type': command_type}
+            if payload:
+                command.update(payload)
+            ws.send(json.dumps(command))
+            result = json.loads(ws.recv())
+            if not result.get('success'):
+                raise RuntimeError((result.get('error') or {}).get('message') or f'{command_type} failed')
+            return result.get('result')
+
+
+    def fire_event(self, event_type: str, event_data: dict | None = None):
+        return self.post(f'/api/events/{event_type}', event_data or {})
+
+    def trigger_shutdown_automations(self, reason: str):
+        # Supervisor host reboot can bypass Home Assistant's normal shutdown event.
+        # Fire the canonical shutdown event first so user automations listening for
+        # Home Assistant shutdown still run before the host goes down.
+        return self.fire_event('homeassistant_stop', {'source': 'fleet_manager', 'reason': reason})
+
+    def list_repairs(self) -> list[dict]:
+        result = self.websocket_command('repairs/list_issues') or {}
+        issues = result.get('issues') if isinstance(result, dict) else result
+        return issues if isinstance(issues, list) else []
+
+    def fix_repair(self, domain: str, issue_id: str):
+        raise RuntimeError('No generic Home Assistant repairs fix command is available')
+
     def discover_updates(self) -> list[dict]:
         states=self.get('/api/states')
         updates=[]
@@ -115,7 +155,7 @@ class HomeAssistantAdapter:
                 continue
             a=st.get('attributes') or {}
             title=a.get('title') or a.get('friendly_name') or eid
-            updates.append({'entity_id':eid,'state':st.get('state'),'component':title,'installed_version':a.get('installed_version'),'available_version':a.get('latest_version'),'release_url':a.get('release_url'),'in_progress':a.get('in_progress'),'skipped_version':a.get('skipped_version'),'raw':st})
+            updates.append({'entity_id':eid,'state':st.get('state'),'component':title,'installed_version':a.get('installed_version'),'available_version':a.get('latest_version'),'release_url':a.get('release_url'),'in_progress':a.get('in_progress'),'skipped_version':a.get('skipped_version'),'supported_features':a.get('supported_features'),'raw':st})
         return updates
 
 def persist_instance_health(db: Session, inst: Instance, token: str):
@@ -137,8 +177,10 @@ def sync_updates(db: Session, inst: Instance, token: str) -> int:
     seen=set()
     for u in updates:
         seen.add(u['entity_id'])
-        is_pending = u.get('state') == 'on'
-        if is_pending: pending += 1
+        same_version = u.get('installed_version') and u.get('available_version') and u.get('installed_version') == u.get('available_version')
+        is_pending = u.get('state') == 'on' and not same_version
+        is_skipped = bool(u.get('skipped_version') and u.get('available_version') and u.get('skipped_version') == u.get('available_version'))
+        if is_pending and not is_skipped: pending += 1
         category=categorize(u.get('component') or '', u['entity_id'])
         release_notes=None; breaking=False; excerpt=None
         if u.get('release_url'):
@@ -152,7 +194,7 @@ def sync_updates(db: Session, inst: Instance, token: str) -> int:
         row.component=u.get('component') or u['entity_id']; row.category=category; row.installed_version=u.get('installed_version'); row.available_version=u.get('available_version')
         row.release_url=u.get('release_url'); row.release_notes=sanitize_release_text(release_notes); row.breaking_state=breaking; row.breaking_excerpt=excerpt
         row.risk_level=risk; row.critical_state=critical_state; row.manual_action_required=manual_required; row.approval_state='required' if is_pending and approval=='approval_required' else 'not_required'
-        row.installation_state='available' if is_pending else 'current'; row.restart_required=category in {'Core','OS','Supervisor'}; row.policy_decision=approval; row.policy_explanation=explanation
+        row.installation_state='skipped' if is_skipped else ('available' if is_pending else 'current'); row.skip_state='skipped' if is_skipped else 'none'; row.restart_required=category in {'Core','OS','Supervisor'}; row.policy_decision=approval; row.policy_explanation=explanation
         row.last_discovered=now(); row.raw_json=json.dumps(u.get('raw') or {}, default=str)[:20000]
     inst.available_updates=pending; inst.critical_updates=critical; inst.pending_approvals=approvals; inst.last_update_scan=now()
     if inst.connectivity_state == 'online' and critical: inst.health_state='warning'
