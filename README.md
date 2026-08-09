@@ -19,13 +19,9 @@ It gives one place to see what needs attention, run safe maintenance actions, an
 
 ## Demo
 
-A standalone static demo is available in a separate repo:
+Try the static demo: [https://ha-fleet-manager-demo.pages.dev/](https://ha-fleet-manager-demo.pages.dev/)
 
-- Demo repo: [ha-fleet-manager-demo](https://github.com/karthikvenkatachalapathi/ha-fleet-manager-demo)
-- Demo email: `admin@example.local`
-- Demo password: `demo-password`
-
-The demo uses the real Fleet Manager browser UI with mock data only. It does not connect to a Home Assistant backend, store tokens, or perform live updates.
+Use the demo login screen credentials shown on the demo page. The demo uses mock data only. It does not connect to a Home Assistant backend, store tokens, or perform live updates.
 
 ## Quick start
 
