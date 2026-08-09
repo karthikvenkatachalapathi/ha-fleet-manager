@@ -271,7 +271,7 @@ let csrf=null, data={instances:[],updates:[],repairs:[],dashboard:null,audit:[],
 let activePage=null, liveTimer=null, settingsTab=localStorage.getItem('hafm-settings-tab')||'Account', repairsLoaded=false, repairsLoading=false;
 const basePages=['Updates','Repairs','Recent activity','Settings'];
 const pageIcons={Updates:'⇧',Repairs:'⚠',Instances:'⌂','Recent activity':'◷',Settings:'⚙'};
-function pages(){let p=[...basePages];if((data.repairs||[]).length)p.splice(1,0,'Repairs');return p}
+function pages(){return [...basePages]}
 let updateSort={key:'risk',dir:'desc'}, instanceSort={key:'friendly_name',dir:'asc'};
 const $=id=>document.getElementById(id);
 function themeIcon(t){return t==='dark'?'<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path></svg>':'<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M21 12.8A8.7 8.7 0 0 1 11.2 3a7.1 7.1 0 1 0 9.8 9.8z"></path></svg>'}
