@@ -44,7 +44,7 @@ Use HTTPS in production.
 
 ## Token rotation
 
-Rotate a Home Assistant token when an operator leaves, a host may have been exposed, backup custody is uncertain, or a token was pasted into the wrong place.
+Rotate a Home Assistant token when an admin leaves, a host may have been exposed, backup custody is uncertain, or a token was pasted into the wrong place.
 
 Replace the token in **Settings → Instance config → Edit Instance**. Leaving the token field blank keeps the existing encrypted token.
 

@@ -1,7 +1,11 @@
 from __future__ import annotations
+import asyncio
 import json
+import re
 import time
 import secrets
+import smtplib
+from email.message import EmailMessage
 from typing import Annotated
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
@@ -87,6 +91,31 @@ class ScheduleIn(BaseModel):
 class PolicyIn(BaseModel):
     value: dict
     description: str | None = None
+class NotificationSettingsIn(BaseModel):
+    ntfy_enabled: bool | None = None
+    ntfy_url: str | None = None
+    ntfy_topic: str | None = None
+    ntfy_token: str | None = None
+    ntfy_clear_token: bool | None = None
+    pushover_enabled: bool | None = None
+    pushover_user_key: str | None = None
+    pushover_app_token: str | None = None
+    pushover_clear_secrets: bool | None = None
+    email_enabled: bool | None = None
+    email_to: str | None = None
+    email_from: str | None = None
+    smtp_host: str | None = None
+    smtp_port: int | None = None
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_clear_password: bool | None = None
+    telegram_enabled: bool | None = None
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+    telegram_clear_token: bool | None = None
+
+class TestNotificationIn(NotificationSettingsIn):
+    channel: str
 
 def ensure_app_defaults(db: Session):
     if engine.url.get_backend_name() == 'sqlite':
@@ -96,15 +125,82 @@ def ensure_app_defaults(db: Session):
         if 'display_name' not in existing:
             db.execute(text('ALTER TABLE users ADD COLUMN display_name VARCHAR(200)'))
     if db.query(Schedule).count() == 0:
-        db.add(Schedule(name='Default monitor cadence', kind='monitor_and_act', cron='0 */6 * * *', enabled=True))
+        db.add(Schedule(name='Fleet update check', kind='update_discovery', cron='every 6h', enabled=True))
+    else:
+        for sched in db.query(Schedule).filter(Schedule.name.in_(['Default monitor cadence','Fleet update check'])).all():
+            sched.name = 'Fleet update check'
+            if sched.kind == 'monitor_and_act':
+                sched.kind = 'update_discovery'
+            if sched.cron == '0 */6 * * *':
+                sched.cron = 'every 6h'
     defaults = {
         'auto_update_policy': {'auto_execute_enabled': True, 'excluded_categories': ['Core','OS','Supervisor','Firmware'], 'excluded_stacks': ['router','zigbee','z-wave','matter','thread'], 'safe_categories': ['Add-on','HACS','Update Entity'], 'requires_public_release_notes': True, 'block_on_breaking_or_action_required': True, 'core_haos_manual_only': True},
         'oidc_settings': {'enabled': False, 'issuer_url': '', 'client_id': '', 'client_secret': '', 'scopes': 'openid email profile', 'button_label': 'Sign in with SSO'},
+        'notification_settings': {'ntfy_enabled': False, 'ntfy_url': '', 'ntfy_topic': '', 'ntfy_token': '', 'pushover_enabled': False, 'pushover_user_key': '', 'pushover_app_token': '', 'email_enabled': False, 'email_to': '', 'email_from': '', 'smtp_host': '', 'smtp_port': 587, 'smtp_username': '', 'smtp_password': '', 'telegram_enabled': False, 'telegram_bot_token': '', 'telegram_chat_id': ''},
     }
     for key, value in defaults.items():
         if not db.query(PolicySetting).filter_by(key=key).one_or_none():
             db.add(PolicySetting(key=key, value_json=json.dumps(value), description='Fleet Manager deterministic update safety policy'))
     db.commit()
+
+def parse_schedule_seconds(value: str | None) -> int:
+    text_value = (value or '').strip().lower()
+    m = re.fullmatch(r'every\s+(\d+)\s*(m|min|minute|minutes|h|hr|hour|hours|d|day|days)', text_value)
+    if m:
+        n = int(m.group(1)); unit = m.group(2)
+        if unit.startswith('m'): return max(300, n * 60)
+        if unit.startswith('h') or unit == 'hr': return max(300, n * 3600)
+        if unit.startswith('d'): return max(300, n * 86400)
+    if text_value == 'hourly': return 3600
+    if text_value == 'daily': return 86400
+    # Support the default cron-like pattern: 0 */6 * * *
+    m = re.fullmatch(r'0\s+\*/(\d+)\s+\*\s+\*\s+\*', text_value)
+    if m: return max(300, int(m.group(1)) * 3600)
+    return 6 * 3600
+
+def run_update_discovery(db: Session, *, actor: str = 'scheduler') -> dict:
+    job = JobRun(kind='update_discovery', status='running', started_at=now(), details_json='{}')
+    db.add(job); db.flush()
+    summary = {'instances': 0, 'sync_ok': 0, 'sync_failed': 0, 'results': []}
+    try:
+        for inst in db.query(Instance).order_by(Instance.friendly_name).all():
+            summary['instances'] += 1
+            try:
+                token = CredentialService().get_instance_token(db, inst.id)
+                persist_instance_health(db, inst, token)
+                pending = sync_updates(db, inst, token)
+                summary['sync_ok'] += 1
+                summary['results'].append({'instance_id': inst.id, 'ok': True, 'pending': pending})
+            except Exception as exc:
+                summary['sync_failed'] += 1
+                summary['results'].append({'instance_id': inst.id, 'ok': False, 'error': str(exc)[:160]})
+        job.status='succeeded'; job.ended_at=now(); job.details_json=json.dumps(summary)
+        audit(db, action='scheduled_update_check_completed', resource_type='job_run', resource_id=job.id, result='success', metadata=summary)
+        return summary
+    except Exception as exc:
+        job.status='failed'; job.ended_at=now(); job.details_json=json.dumps({'error': type(exc).__name__, **summary})
+        audit(db, action='scheduled_update_check_failed', resource_type='job_run', resource_id=job.id, result='failed', metadata={'error': type(exc).__name__})
+        raise
+
+async def schedule_loop():
+    await asyncio.sleep(10)
+    while True:
+        try:
+            with SessionLocal() as db:
+                sched = db.query(Schedule).filter(Schedule.enabled == True, Schedule.kind.in_(['update_discovery','monitor_and_act'])).order_by(Schedule.id).first()
+                if sched:
+                    interval = parse_schedule_seconds(sched.cron)
+                    due = not sched.last_run_at or (now() - sched.last_run_at).total_seconds() >= interval
+                    if due:
+                        if sched.kind == 'monitor_and_act':
+                            summary = monitor_and_act(db, auto_execute=False, actor='scheduler')
+                        else:
+                            summary = run_update_discovery(db, actor='scheduler')
+                        sched.last_run_at = now()
+                        db.commit()
+        except Exception:
+            pass
+        await asyncio.sleep(60)
 
 def startup_init():
     Base.metadata.create_all(engine)
@@ -112,6 +208,10 @@ def startup_init():
         ensure_app_defaults(db)
         ensure_admin(db)
 startup_init()
+
+@app.on_event('startup')
+async def start_scheduler_task():
+    asyncio.create_task(schedule_loop())
 
 def current_session(request: Request, db: Session = Depends(get_db)):
     s=validate_session(db, request.cookies.get(SESSION_COOKIE))
@@ -228,6 +328,71 @@ def default_oidc_settings() -> dict:
 def serialize_oidc_settings(value: dict) -> dict:
     return {k: value.get(k, default_oidc_settings()[k]) for k in ['enabled','issuer_url','client_id','scopes','button_label']} | {'client_secret_configured': bool(value.get('client_secret'))}
 
+def default_notification_settings() -> dict:
+    return {'ntfy_enabled': False, 'ntfy_url': '', 'ntfy_topic': '', 'ntfy_token': '', 'pushover_enabled': False, 'pushover_user_key': '', 'pushover_app_token': '', 'email_enabled': False, 'email_to': '', 'email_from': '', 'smtp_host': '', 'smtp_port': 587, 'smtp_username': '', 'smtp_password': '', 'telegram_enabled': False, 'telegram_bot_token': '', 'telegram_chat_id': ''}
+
+def serialize_notification_settings(value: dict) -> dict:
+    d = default_notification_settings()
+    merged = {k: value.get(k, d[k]) for k in d}
+    for secret in ['ntfy_token','pushover_user_key','pushover_app_token','smtp_password','telegram_bot_token']:
+        merged.pop(secret, None)
+        merged[f'{secret}_configured'] = bool(value.get(secret))
+    return merged
+
+
+def merged_notification_settings(saved: dict, incoming: NotificationSettingsIn | None = None) -> dict:
+    value = dict(default_notification_settings())
+    value.update(saved or {})
+    if incoming:
+        for key in default_notification_settings():
+            if hasattr(incoming, key):
+                val = getattr(incoming, key)
+                if val is not None and val != '':
+                    value[key] = val.strip() if isinstance(val, str) else val
+    return value
+
+def send_test_notification(channel: str, cfg: dict) -> dict:
+    channel = (channel or '').strip().lower()
+    title = 'Home Assistant Fleet Manager test notification'
+    body = 'This is a test notification from Home Assistant Fleet Manager.'
+    if channel == 'ntfy':
+        url = (cfg.get('ntfy_url') or 'https://ntfy.sh').rstrip('/')
+        topic = (cfg.get('ntfy_topic') or '').strip('/')
+        if not topic: raise HTTPException(422, 'ntfy topic is required')
+        headers = {'Title': title}
+        if cfg.get('ntfy_token'): headers['Authorization'] = f"Bearer {cfg['ntfy_token']}"
+        with httpx.Client(timeout=15, trust_env=False) as client:
+            r = client.post(f'{url}/{topic}', content=body.encode(), headers=headers)
+            r.raise_for_status()
+        return {'ok': True, 'channel': channel}
+    if channel == 'pushover':
+        if not cfg.get('pushover_user_key') or not cfg.get('pushover_app_token'):
+            raise HTTPException(422, 'Pushover user key and application token are required')
+        with httpx.Client(timeout=15, trust_env=False) as client:
+            r = client.post('https://api.pushover.net/1/messages.json', data={'token': cfg['pushover_app_token'], 'user': cfg['pushover_user_key'], 'title': title, 'message': body})
+            r.raise_for_status()
+        return {'ok': True, 'channel': channel}
+    if channel == 'telegram':
+        if not cfg.get('telegram_bot_token') or not cfg.get('telegram_chat_id'):
+            raise HTTPException(422, 'Telegram bot token and chat ID are required')
+        url = f"https://api.telegram.org/bot{cfg['telegram_bot_token']}/sendMessage"
+        with httpx.Client(timeout=15, trust_env=False) as client:
+            r = client.post(url, json={'chat_id': cfg['telegram_chat_id'], 'text': f'{title}\n\n{body}'})
+            r.raise_for_status()
+        return {'ok': True, 'channel': channel}
+    if channel == 'email':
+        for key in ['email_to','email_from','smtp_host']:
+            if not cfg.get(key): raise HTTPException(422, f'{key} is required')
+        msg = EmailMessage(); msg['Subject'] = title; msg['From'] = cfg['email_from']; msg['To'] = cfg['email_to']; msg.set_content(body)
+        port = int(cfg.get('smtp_port') or 587)
+        with smtplib.SMTP(cfg['smtp_host'], port, timeout=15) as smtp:
+            smtp.starttls()
+            if cfg.get('smtp_username') or cfg.get('smtp_password'):
+                smtp.login(cfg.get('smtp_username') or '', cfg.get('smtp_password') or '')
+            smtp.send_message(msg)
+        return {'ok': True, 'channel': channel}
+    raise HTTPException(422, 'Channel must be ntfy, pushover, email, or telegram')
+
 def oidc_discovery(issuer_url: str) -> dict:
     issuer = issuer_url.rstrip('/')
     with httpx.Client(follow_redirects=True, timeout=15, trust_env=False) as client:
@@ -336,6 +501,58 @@ def update_oidc_settings(data: OidcSettingsIn, s=Depends(csrf), db: Session = De
     after = serialize_oidc_settings(value)
     audit(db, action='oidc_settings_updated', resource_type='application_settings', actor_user_id=s.user_id, before=before, after=after)
     db.commit(); return after
+
+@app.get('/api/notification-settings')
+def get_notification_settings(s=Depends(current_session), db: Session = Depends(get_db)):
+    require_permission(s, 'modify_update_policies')
+    return serialize_notification_settings(load_json_setting(db, 'notification_settings', default_notification_settings()))
+
+@app.patch('/api/notification-settings')
+def update_notification_settings(data: NotificationSettingsIn, s=Depends(csrf), db: Session = Depends(get_db)):
+    require_permission(s, 'modify_update_policies')
+    value = load_json_setting(db, 'notification_settings', default_notification_settings())
+    before = serialize_notification_settings(value)
+    text_fields = ['ntfy_url','ntfy_topic','email_to','email_from','smtp_host','smtp_username','telegram_chat_id']
+    bool_fields = ['ntfy_enabled','pushover_enabled','email_enabled','telegram_enabled']
+    for key in bool_fields:
+        incoming = getattr(data, key)
+        if incoming is not None:
+            value[key] = bool(incoming)
+    for key in text_fields:
+        incoming = getattr(data, key)
+        if incoming is not None:
+            value[key] = incoming.strip()
+    if data.smtp_port is not None:
+        if data.smtp_port < 1 or data.smtp_port > 65535:
+            raise HTTPException(422, 'SMTP port must be between 1 and 65535')
+        value['smtp_port'] = data.smtp_port
+    secret_pairs = [('ntfy_token', data.ntfy_token, data.ntfy_clear_token), ('pushover_user_key', data.pushover_user_key, data.pushover_clear_secrets), ('pushover_app_token', data.pushover_app_token, data.pushover_clear_secrets), ('smtp_password', data.smtp_password, data.smtp_clear_password), ('telegram_bot_token', data.telegram_bot_token, data.telegram_clear_token)]
+    for key, incoming, clear in secret_pairs:
+        if clear:
+            value[key] = ''
+        elif incoming:
+            value[key] = incoming
+    save_json_setting(db, 'notification_settings', value, 'Outbound notification channel settings')
+    after = serialize_notification_settings(value)
+    audit(db, action='notification_settings_updated', resource_type='application_settings', actor_user_id=s.user_id, before=before, after=after)
+    db.commit(); return after
+
+
+@app.post('/api/notification-settings/test')
+def test_notification_settings(data: TestNotificationIn, s=Depends(csrf), db: Session = Depends(get_db)):
+    require_permission(s, 'modify_update_policies')
+    saved = load_json_setting(db, 'notification_settings', default_notification_settings())
+    cfg = merged_notification_settings(saved, data)
+    try:
+        result = send_test_notification(data.channel, cfg)
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(502, f'Test notification failed: HTTP {exc.response.status_code}')
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f'Test notification failed: {type(exc).__name__}')
+    except smtplib.SMTPException as exc:
+        raise HTTPException(502, f'Test email failed: {type(exc).__name__}: {str(exc)[:160]}')
+    audit(db, action='test_notification_sent', resource_type='application_settings', actor_user_id=s.user_id, metadata={'channel': data.channel})
+    db.commit(); return result
 
 @app.get('/api/auth/oidc/config')
 def oidc_public_config(db: Session = Depends(get_db)):
@@ -485,12 +702,9 @@ def restart_instance(instance_id:int, s=Depends(csrf), db: Session = Depends(get
 
 @app.post('/api/sync-all')
 def sync_all(s=Depends(csrf), db: Session = Depends(get_db)):
-    require_permission(s,'view_updates'); out=[]
-    for inst in db.query(Instance).all():
-        try:
-            token=CredentialService().get_instance_token(db, inst.id); persist_instance_health(db, inst, token); pending=sync_updates(db, inst, token); out.append({'instance_id':inst.id,'ok':True,'pending':pending})
-        except Exception as exc: out.append({'instance_id':inst.id,'ok':False,'error':str(exc)[:160]})
-    audit(db, action='job_executed', resource_type='sync_all', actor_user_id=s.user_id, metadata={'results':out}); db.commit(); return {'results':out}
+    require_permission(s,'view_updates')
+    summary = run_update_discovery(db, actor=f'user:{s.user.email}')
+    db.commit(); return summary
 
 
 def humanize_repair_text(value: str | None) -> str:
@@ -504,9 +718,12 @@ def humanize_repair_text(value: str | None) -> str:
 
 def repair_action_for_issue(issue: dict) -> str | None:
     key = str(issue.get('translation_key') or '').lower()
-    text = f"{issue.get('domain') or ''} {key} {issue.get('issue_id') or ''}".lower()
-    if issue.get('domain') == 'hassio' and ('system_reboot_required' in text or 'reboot' in text):
+    placeholders = issue.get('translation_placeholders') or {}
+    text = ' '.join(str(x or '') for x in [issue.get('domain'), key, issue.get('issue_id'), placeholders.get('name')]).lower().replace('_', ' ').replace('-', ' ')
+    if issue.get('domain') == 'hassio' and ('system_reboot_required' in text or 'reboot required' in text):
         return 'host_reboot'
+    if 'restart required' in text or 'reboot required' in text:
+        return 'ha_restart'
     return None
 
 def serialize_repair_issue(issue: dict, inst: Instance) -> dict:
@@ -560,12 +777,16 @@ def fix_repair(data: RepairFixIn, s=Depends(csrf), db: Session = Depends(get_db)
     try:
         requested_action = (data.action or '').strip()
         adapter = HomeAssistantAdapter(inst, token)
+        reboot_result = {}
         if requested_action == 'host_reboot':
             adapter.trigger_shutdown_automations('host_reboot')
             inst.connectivity_state='restarting'; inst.health_state='restarting'; inst.last_failed_connection=now()
             db.flush()
             time.sleep(3)
             reboot_result = adapter.host_reboot()
+        elif requested_action == 'ha_restart':
+            adapter.post('/api/services/homeassistant/restart', {})
+            inst.connectivity_state='restarting'; inst.health_state='restarting'; inst.last_failed_connection=now()
         else:
             raise HTTPException(422, 'No Fleet Manager action for this repair')
         audit(db, action='repair_fix_requested', resource_type='repair', actor_user_id=s.user_id, resource_id=data.issue_id, instance_id=inst.id, metadata={'domain': data.domain, 'issue_id': data.issue_id, 'action': requested_action, 'state': inst.connectivity_state, 'reboot_endpoint': reboot_result.get('endpoint'), 'attempts': reboot_result.get('attempts')})
@@ -675,7 +896,7 @@ def install_single_update(update_id:int, s=Depends(csrf), db: Session = Depends(
     if upd.installation_state != 'available':
         raise HTTPException(422,'Update is not pending')
     op=install_update(db, inst, upd, actor=f'user:{s.user.email}')
-    db.commit(); return {'ok': op.status in {'succeeded','accepted'}, 'status': op.status, 'state': op.state, 'operation_id': op.id, 'update': serialize_update(upd)}
+    db.commit(); return {'ok': op.status in {'succeeded','accepted','action_required'}, 'status': op.status, 'state': op.state, 'operation_id': op.id, 'update': serialize_update(upd), 'details': json.loads(op.details_json or '{}')}
 
 @app.post('/api/updates/bulk')
 def bulk_updates(data: BulkUpdateIn, s=Depends(csrf), db: Session = Depends(get_db)):
@@ -685,7 +906,7 @@ def bulk_updates(data: BulkUpdateIn, s=Depends(csrf), db: Session = Depends(get_
     updates = db.query(UpdateRecord).filter(UpdateRecord.id.in_(data.update_ids)).all()
     instances = {i.id: i for i in db.query(Instance).filter(Instance.id.in_({u.instance_id for u in updates})).all()}
     policy = load_auto_policy(db)
-    summary = {'action': action, 'selected': len(data.update_ids), 'found': len(updates), 'updated': 0, 'skipped': 0, 'reviewed': 0, 'blocked': [], 'failed': []}
+    summary = {'action': action, 'selected': len(data.update_ids), 'found': len(updates), 'updated': 0, 'action_required': 0, 'skipped': 0, 'reviewed': 0, 'blocked': [], 'failed': []}
     if action == 'skip':
         require_permission(s, 'view_updates')
         for upd in updates:
@@ -717,7 +938,9 @@ def bulk_updates(data: BulkUpdateIn, s=Depends(csrf), db: Session = Depends(get_
             if upd.installation_state != 'available' or upd.skip_state == 'skipped':
                 summary['blocked'].append({'id': upd.id, 'instance': inst.friendly_name, 'component': upd.component, 'reason': 'not_pending'}); continue
             op = install_update(db, inst, upd, actor=f'user:{s.user.email}')
-            if op.status in {'succeeded','accepted'}:
+            if op.status == 'action_required':
+                summary['action_required'] += 1
+            elif op.status in {'succeeded','accepted'}:
                 summary['updated'] += 1
             else:
                 summary['blocked'].append({'id': upd.id, 'instance': inst.friendly_name, 'component': upd.component, 'reason': op.state})

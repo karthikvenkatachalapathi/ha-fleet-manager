@@ -93,7 +93,7 @@ curl -fsS http://127.0.0.1:8799/health/ready
 ## Hardening checklist
 
 - [ ] Use HTTPS.
-- [ ] Restrict the UI to trusted operators.
+- [ ] Restrict the UI to trusted admins.
 - [ ] Use a strong admin password or OIDC.
 - [ ] Keep `.env.local` out of Git.
 - [ ] Back up the database and encryption key.

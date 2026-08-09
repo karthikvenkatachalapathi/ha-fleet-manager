@@ -7,7 +7,7 @@ Use this before pushing a public branch.
 - source: `fleet_manager/`, `ha_update_dashboard/`
 - tests: `tests/`
 - deployment examples: `deploy/`, `Dockerfile`, `docker-compose.yml`
-- docs: `README.md`, `SETUP.md`, `DEPLOYMENT.md`, `DOCKER.md`, `SECURITY.md`, `ARCHITECTURE.md`
+- docs: `README.md`, `SETUP.md`, `DEPLOYMENT.md`, `DOCKER.md`, `SECURITY.md`, `STANDARD_LINEAGE.md`
 - config examples: `.env.example`, `.gitignore`, `.dockerignore`, `requirements.txt`, `pyproject.toml`
 
 ## Exclude
@@ -30,7 +30,7 @@ python -m compileall fleet_manager ha_update_dashboard tests
 pytest -q
 ```
 
-Run a privacy scan for private domains, local IP ranges, real operator emails, OAuth IDs, Home Assistant tokens, SQLite files, and generated runtime state.
+Run a privacy scan for private domains, local IP ranges, real emails, OAuth IDs, Home Assistant tokens, SQLite files, and generated runtime state.
 
 ## Branch policy
 

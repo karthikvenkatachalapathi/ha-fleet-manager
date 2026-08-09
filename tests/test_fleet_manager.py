@@ -315,7 +315,8 @@ def test_ui_audit_headers_and_bottom_menu_icons():
     assert "x-fleet-page" in html
     assert "x-fleet-menu" in html
     assert 'class="topActions"' in html
-    assert 'onclick="syncAll()" title="Refresh"' in html
+    assert 'onclick="syncAll()"' in html
+    assert 'aria-label="Refresh fleet status"' in html
     assert 'class="iconBtn logoutIcon"' in html
     assert '<svg viewBox="0 0 32 32" aria-hidden="true"' in html
     assert 'class="door"' in html
@@ -444,7 +445,7 @@ def test_pwa_routes_served():
     sw = client.get('/sw.js')
     assert sw.status_code == 200
     assert 'Service-Worker-Allowed' in sw.headers
-    assert "ha-fleet-manager-v3" in sw.text
+    assert "ha-fleet-manager-v" in sw.text
 
 
 def test_mobile_nav_and_metrics_are_compact():
@@ -463,7 +464,7 @@ def test_mobile_bottom_bar_hides_logo_and_controls():
     assert 'nav .brand,.app:not(.expanded) nav .brand,.app.expanded nav .brand{display:none!important}' in html
     assert '.navControls{display:none!important}' in html
     assert 'grid-template-columns:1fr;gap:0' in html
-    assert "ha-fleet-manager-v3" in sw
+    assert "ha-fleet-manager-v" in sw
 
 
 def test_mobile_logo_moves_to_content_header_not_bottom_nav():
@@ -473,4 +474,4 @@ def test_mobile_logo_moves_to_content_header_not_bottom_nav():
     assert 'class="mobileTopLogo"' in html
     assert '.mobileTopLogo{display:block;flex:0 0 34px}' in html
     assert 'nav .brand,.app:not(.expanded) nav .brand,.app.expanded nav .brand{display:none!important}' in html
-    assert 'ha-fleet-manager-v3' in sw
+    assert 'ha-fleet-manager-v' in sw

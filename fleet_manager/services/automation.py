@@ -172,13 +172,46 @@ def current_approval_for(db: Session, update: UpdateRecord) -> Approval | None:
 
 
 def mark_manual_notifications(db: Session, inst: Instance, update: UpdateRecord) -> bool:
-    title = f'Manual Home Assistant update required: {inst.friendly_name} / {update.component}'
-    body = f'{update.component} {update.installed_version or "unknown"} → {update.available_version or "unknown"} is {update.category}; Core/HAOS/Supervisor/Firmware policy requires human handling.'
-    exists = db.query(Notification).filter_by(title=title, status='open', update_record_id=update.id).one_or_none()
-    if not exists:
-        create_notification(db, severity='warning', title=title, body=body, instance_id=inst.id, update_id=update.id)
-        return True
-    return False
+    return mark_manual_update_notifications(db, inst, [update])
+
+
+def _manual_update_line(update: UpdateRecord) -> str:
+    return f'- {update.component}: {update.installed_version or "unknown"} → {update.available_version or "unknown"} ({update.category})'
+
+
+def mark_manual_update_notifications(db: Session, inst: Instance, updates: list[UpdateRecord]) -> bool:
+    pending = [u for u in updates if u.installation_state == 'available' and u.skip_state != 'skipped']
+    if not pending:
+        return False
+    if len(pending) == 1:
+        update = pending[0]
+        title = f'Manual Home Assistant update required: {inst.friendly_name} / {update.component}'
+        body = f'{update.component} {update.installed_version or "unknown"} → {update.available_version or "unknown"} is {update.category}; Core/HAOS/Supervisor/Firmware policy requires human handling.'
+        exists = db.query(Notification).filter_by(title=title, status='open', update_record_id=update.id).one_or_none()
+        if not exists:
+            create_notification(db, severity='warning', title=title, body=body, instance_id=inst.id, update_id=update.id)
+            return True
+        return False
+
+    title = f'Manual Home Assistant updates required: {inst.friendly_name}'
+    body = f'{len(pending)} updates require human handling on {inst.friendly_name}:\n' + '\n'.join(_manual_update_line(u) for u in pending[:12])
+    if len(pending) > 12:
+        body += f'\n- … {len(pending) - 12} more'
+    exists = db.query(Notification).filter_by(title=title, status='open', instance_id=inst.id, update_record_id=None).one_or_none()
+    if exists:
+        if exists.body != body:
+            exists.body = body
+            return True
+        return False
+
+    # Collapse any older per-update manual notices for this instance once there is a group notice.
+    prefix = f'Manual Home Assistant update required: {inst.friendly_name} /'
+    for old in db.query(Notification).filter(Notification.status == 'open', Notification.instance_id == inst.id).all():
+        if old.title.startswith(prefix):
+            old.status = 'superseded'
+            old.acknowledged_at = now()
+    create_notification(db, severity='warning', title=title, body=body, instance_id=inst.id, update_id=None)
+    return True
 
 
 def _poll_update_install_result(adapter: HomeAssistantAdapter, entity_id: str, target_version: str | None, *, attempts: int = 10, delay: float = 3.0) -> tuple[bool, dict, dict, list[dict]]:
@@ -200,6 +233,35 @@ def _poll_update_install_result(adapter: HomeAssistantAdapter, entity_id: str, t
             time.sleep(delay)
     return False, after, after_attrs, observations
 
+
+
+
+def _restart_repair_issues(adapter: HomeAssistantAdapter) -> list[dict]:
+    """Return active HA repair issues that mean the install is not fully complete yet."""
+    issues: list[dict] = []
+    try:
+        raw_issues = adapter.list_repairs()
+    except Exception:
+        return issues
+    for issue in raw_issues:
+        placeholders = issue.get('translation_placeholders') or {}
+        text = ' '.join(str(x or '') for x in [
+            issue.get('domain'),
+            issue.get('issue_id'),
+            issue.get('translation_key'),
+            placeholders.get('name'),
+            placeholders.get('addon'),
+            placeholders.get('integration'),
+        ]).lower().replace('_', ' ').replace('-', ' ')
+        if 'restart required' in text or 'reboot required' in text or 'system_reboot_required' in text:
+            issues.append({
+                'domain': issue.get('domain'),
+                'issue_id': issue.get('issue_id'),
+                'translation_key': issue.get('translation_key'),
+                'title': placeholders.get('name') or issue.get('translation_key') or issue.get('issue_id'),
+                'severity': issue.get('severity') or 'warning',
+            })
+    return issues
 
 def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: str = 'automation') -> Operation:
     token = CredentialService().get_instance_token(db, inst.id)
@@ -228,12 +290,18 @@ def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: 
         post_exception = {'type': type(exc).__name__, 'message': str(exc)[:300]}
     op.state = 'Validating'; db.flush()
     success, after, after_attrs, observations = _poll_update_install_result(adapter, update.entity_id, update.available_version)
+    restart_repairs = _restart_repair_issues(adapter) if success else []
     if success:
-        op.state = 'Succeeded'
-        op.status = 'succeeded'
         update.installation_state = 'installed'
         update.installed_version = update.available_version
         update.approval_state = 'not_required'
+        if restart_repairs:
+            op.state = 'Installed — restart required'
+            op.status = 'action_required'
+            update.restart_required = True
+        else:
+            op.state = 'Succeeded'
+            op.status = 'succeeded'
     elif post_exception:
         op.state = 'Accepted by Home Assistant; verification pending'
         op.status = 'accepted'
@@ -242,7 +310,7 @@ def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: 
         op.status = 'manual_intervention_required'
         create_notification(db, severity='critical', title=f'Home Assistant update needs manual validation: {inst.friendly_name} / {update.component}', body=f'Install service returned but update still appears pending for {update.entity_id}.', instance_id=inst.id, update_id=update.id)
     op.ended_at = now()
-    op.details_json = json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': update.available_version, 'backup_requested': bool(payload.get('backup')), 'service_payload': payload, 'service_response': response, 'post_exception': post_exception, 'before': {'state': before.get('state'), 'installed_version': attrs.get('installed_version'), 'latest_version': attrs.get('latest_version')}, 'after': {'state': after.get('state'), 'installed_version': after_attrs.get('installed_version'), 'latest_version': after_attrs.get('latest_version'), 'in_progress': after_attrs.get('in_progress')}, 'validation_observations': observations[-8:]})
+    op.details_json = json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': update.available_version, 'backup_requested': bool(payload.get('backup')), 'service_payload': payload, 'service_response': response, 'post_exception': post_exception, 'restart_repairs': restart_repairs if 'restart_repairs' in locals() else [], 'before': {'state': before.get('state'), 'installed_version': attrs.get('installed_version'), 'latest_version': attrs.get('latest_version')}, 'after': {'state': after.get('state'), 'installed_version': after_attrs.get('installed_version'), 'latest_version': after_attrs.get('latest_version'), 'in_progress': after_attrs.get('in_progress')}, 'validation_observations': observations[-8:]})
     append_vault_update_log(
         f'{ct_now()} — {inst.friendly_name} — {update.component}',
         [
@@ -256,7 +324,7 @@ def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: 
             f'- Operation ID: {op.id}',
         ],
     )
-    audit_action = 'update_install_executed' if op.status != 'accepted' else 'update_install_accepted_unverified'
+    audit_action = 'update_install_action_required' if op.status == 'action_required' else ('update_install_executed' if op.status != 'accepted' else 'update_install_accepted_unverified')
     audit(db, action=audit_action, resource_type='update_record', resource_id=update.id, instance_id=inst.id, result=op.status, metadata={'operation_id': op.id, 'target_version': update.available_version, 'actor': actor, 'post_exception': post_exception.get('type') if post_exception else None})
     return op
 
@@ -301,11 +369,16 @@ def monitor_and_act(db: Session, *, auto_execute: bool = True, actor: str = 'aut
                 create_notification(db, severity='critical', title=f'Home Assistant sync failed: {inst.friendly_name}', body=f'{type(exc).__name__}: {str(exc)[:300]}', instance_id=inst.id)
                 continue
             updates = db.query(UpdateRecord).filter_by(instance_id=inst.id, installation_state='available').all()
+            manual_updates: list[UpdateRecord] = []
+            auto_review_updates: list[UpdateRecord] = []
             for upd in updates:
                 if upd.category in set(policy.get('excluded_categories') or []) or upd.entity_id in AUTO_EXCLUDED_ENTITY_IDS or update_matches_stack(upd, policy.get('excluded_stacks') or []) or upd.approval_state == 'required':
-                    if mark_manual_notifications(db, inst, upd):
-                        summary['manual_notifications'] += 1
-                    continue
+                    manual_updates.append(upd)
+                else:
+                    auto_review_updates.append(upd)
+            if mark_manual_update_notifications(db, inst, manual_updates):
+                summary['manual_notifications'] += 1
+            for upd in auto_review_updates:
                 ok, reasons, _notes = review_update_for_auto(upd, policy)
                 if ok:
                     summary['auto_candidates'] += 1
