@@ -16,6 +16,17 @@ It gives one place to see what needs attention, run safe maintenance actions, an
 - Supports password login and optional OIDC login.
 - Runs with Python or Docker.
 
+
+## Demo
+
+A standalone static demo is available in a separate repo:
+
+- Demo repo: [ha-fleet-manager-demo](https://github.com/karthikvenkatachalapathi/ha-fleet-manager-demo)
+- Demo email: `admin@example.local`
+- Demo password: `demo-password`
+
+The demo uses the real Fleet Manager browser UI with mock data only. It does not connect to a Home Assistant backend, store tokens, or perform live updates.
+
 ## Quick start
 
 ```bash
