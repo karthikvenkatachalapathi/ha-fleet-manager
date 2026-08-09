@@ -74,8 +74,6 @@ If an update is visible, an admin can update or skip it. Fleet Manager checks th
 - [DEPLOYMENT.md](DEPLOYMENT.md) - systemd, reverse proxy, upgrades, rollback
 - [SECURITY.md](SECURITY.md) - token handling and deployment notes
 - [STANDARD_LINEAGE.md](STANDARD_LINEAGE.md) - project boundaries and public examples
-- [docs/blog-post.md](docs/blog-post.md) - project story and use case
-- [docs/linkedin-blurb.md](docs/linkedin-blurb.md) - short launch blurb
 
 ## Useful commands
 
