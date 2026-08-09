@@ -75,6 +75,7 @@ If an update is visible, an admin can update or skip it. Fleet Manager checks th
 - [SECURITY.md](SECURITY.md) - token handling and deployment notes
 - [STANDARD_LINEAGE.md](STANDARD_LINEAGE.md) - project boundaries and public examples
 - [docs/blog-post.md](docs/blog-post.md) - project story and use case
+- [docs/demo/README.md](docs/demo/README.md) - static demo notes
 - [docs/linkedin-blurb.md](docs/linkedin-blurb.md) - short launch blurb
 
 ## Useful commands
