@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import re
+import smtplib
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from pathlib import Path
 import os
 from urllib.parse import urlparse
@@ -51,6 +53,25 @@ DEFAULT_AUTO_POLICY = {
 MAX_RELEASE_BYTES = 250_000
 BREAKING_RE = re.compile(r'(breaking changes?|backward.?incompatible|action required|migration required|manual migration|deprecated|removed|upgrade notes?)', re.I)
 UPDATE_FEATURE_BACKUP = 8
+DEFAULT_NOTIFICATION_SETTINGS = {
+    'ntfy_enabled': False,
+    'ntfy_url': '',
+    'ntfy_topic': '',
+    'ntfy_token': '',
+    'pushover_enabled': False,
+    'pushover_user_key': '',
+    'pushover_app_token': '',
+    'email_enabled': False,
+    'email_to': '',
+    'email_from': '',
+    'smtp_host': '',
+    'smtp_port': 587,
+    'smtp_username': '',
+    'smtp_password': '',
+    'telegram_enabled': False,
+    'telegram_bot_token': '',
+    'telegram_chat_id': '',
+}
 
 
 
@@ -69,6 +90,113 @@ def load_auto_policy(db: Session) -> dict:
         return normalized_policy(json.loads(row.value_json or '{}'))
     except json.JSONDecodeError:
         return normalized_policy()
+
+
+def _load_json_setting(db: Session, key: str, default: dict) -> dict:
+    row = db.query(PolicySetting).filter_by(key=key).one_or_none()
+    if not row:
+        return dict(default)
+    try:
+        value = json.loads(row.value_json or '{}')
+    except json.JSONDecodeError:
+        return dict(default)
+    if not isinstance(value, dict):
+        return dict(default)
+    return {**default, **value}
+
+
+def load_notification_settings(db: Session) -> dict:
+    return _load_json_setting(db, 'notification_settings', DEFAULT_NOTIFICATION_SETTINGS)
+
+
+def _send_ntfy(cfg: dict, title: str, body: str) -> None:
+    url = (cfg.get('ntfy_url') or 'https://ntfy.sh').rstrip('/')
+    topic = (cfg.get('ntfy_topic') or '').strip('/')
+    if not topic:
+        raise ValueError('ntfy topic is required')
+    headers = {'Title': title}
+    if cfg.get('ntfy_token'):
+        headers['Authorization'] = f"Bearer {cfg['ntfy_token']}"
+    with httpx.Client(timeout=15, trust_env=False) as client:
+        client.post(f'{url}/{topic}', content=body.encode(), headers=headers).raise_for_status()
+
+
+def _send_pushover(cfg: dict, title: str, body: str) -> None:
+    if not cfg.get('pushover_user_key') or not cfg.get('pushover_app_token'):
+        raise ValueError('Pushover user key and application token are required')
+    with httpx.Client(timeout=15, trust_env=False) as client:
+        client.post(
+            'https://api.pushover.net/1/messages.json',
+            data={'token': cfg['pushover_app_token'], 'user': cfg['pushover_user_key'], 'title': title, 'message': body},
+        ).raise_for_status()
+
+
+def _send_telegram(cfg: dict, title: str, body: str) -> None:
+    if not cfg.get('telegram_bot_token') or not cfg.get('telegram_chat_id'):
+        raise ValueError('Telegram bot token and chat ID are required')
+    url = f"https://api.telegram.org/bot{cfg['telegram_bot_token']}/sendMessage"
+    with httpx.Client(timeout=15, trust_env=False) as client:
+        client.post(url, json={'chat_id': cfg['telegram_chat_id'], 'text': f'{title}\n\n{body}'}).raise_for_status()
+
+
+def _send_email(cfg: dict, title: str, body: str) -> None:
+    for key in ['email_to', 'email_from', 'smtp_host']:
+        if not cfg.get(key):
+            raise ValueError(f'{key} is required')
+    msg = EmailMessage()
+    msg['Subject'] = title
+    msg['From'] = cfg['email_from']
+    msg['To'] = cfg['email_to']
+    msg.set_content(body)
+    with smtplib.SMTP(cfg['smtp_host'], int(cfg.get('smtp_port') or 587), timeout=15) as smtp:
+        smtp.starttls()
+        if cfg.get('smtp_username') or cfg.get('smtp_password'):
+            smtp.login(cfg.get('smtp_username') or '', cfg.get('smtp_password') or '')
+        smtp.send_message(msg)
+
+
+def dispatch_notification(db: Session, notification: Notification) -> dict[str, str]:
+    """Send a DB notification through every enabled outbound channel.
+
+    Dispatch failures are audited but never prevent the dashboard notification
+    from being created. Secrets are intentionally excluded from audit metadata.
+    """
+    cfg = load_notification_settings(db)
+    senders = {
+        'ntfy': ('ntfy_enabled', _send_ntfy),
+        'pushover': ('pushover_enabled', _send_pushover),
+        'email': ('email_enabled', _send_email),
+        'telegram': ('telegram_enabled', _send_telegram),
+    }
+    results: dict[str, str] = {}
+    for channel, (enabled_key, sender) in senders.items():
+        if not cfg.get(enabled_key):
+            continue
+        try:
+            sender(cfg, notification.title, notification.body)
+        except Exception as exc:
+            results[channel] = f'failed:{type(exc).__name__}'
+            audit(
+                db,
+                action='notification_dispatch_failed',
+                resource_type='notification',
+                resource_id=notification.id,
+                instance_id=notification.instance_id,
+                result='failed',
+                metadata={'channel': channel, 'error': type(exc).__name__, 'message': str(exc)[:160]},
+            )
+        else:
+            results[channel] = 'sent'
+            audit(
+                db,
+                action='notification_dispatch_sent',
+                resource_type='notification',
+                resource_id=notification.id,
+                instance_id=notification.instance_id,
+                result='success',
+                metadata={'channel': channel},
+            )
+    return results
 
 
 def update_matches_stack(update: UpdateRecord, stacks: list[str]) -> str | None:
@@ -164,6 +292,8 @@ def review_update_for_auto(update: UpdateRecord, policy: dict | None = None) -> 
 def create_notification(db: Session, *, severity: str, title: str, body: str, instance_id: int | None = None, update_id: int | None = None) -> Notification:
     n = Notification(severity=severity, title=title, body=body, instance_id=instance_id, update_record_id=update_id)
     db.add(n)
+    db.flush()
+    dispatch_notification(db, n)
     return n
 
 
@@ -222,10 +352,10 @@ def _poll_update_install_result(adapter: HomeAssistantAdapter, entity_id: str, t
         try:
             after = adapter.get(f'/api/states/{entity_id}')
             after_attrs = after.get('attributes') or {}
-            observations.append({'attempt': attempt, 'state': after.get('state'), 'installed_version': after_attrs.get('installed_version'), 'latest_version': after_attrs.get('latest_version'), 'in_progress': after_attrs.get('in_progress')})
+            observations.append({'attempt': attempt, 'state': after.get('state'), 'installed_version': after_attrs.get('installed_version'), 'latest_version': after_attrs.get('latest_version'), 'in_progress': after_attrs.get('in_progress'), 'update_percentage': after_attrs.get('update_percentage')})
             if target_version and after_attrs.get('installed_version') == target_version:
                 return True, after, after_attrs, observations
-            if after.get('state') != 'on' and not after_attrs.get('in_progress'):
+            if not target_version and after.get('state') != 'on' and not after_attrs.get('in_progress'):
                 return True, after, after_attrs, observations
         except Exception as exc:
             observations.append({'attempt': attempt, 'error_type': type(exc).__name__, 'error': str(exc)[:240]})
@@ -282,18 +412,42 @@ def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: 
         payload['backup'] = True
     response = None
     post_exception = None
-    try:
-        response = adapter.post('/api/services/update/install', payload)
-    except Exception as exc:
-        # Add-ons such as Cloudflared can interrupt their own tunnel/API path while the update is actually accepted.
-        # Poll before reporting; do not mark a persistent 5xx as success just because preflight passed.
-        post_exception = {'type': type(exc).__name__, 'message': str(exc)[:300]}
-    op.state = 'Validating'; db.flush()
-    success, after, after_attrs, observations = _poll_update_install_result(adapter, update.entity_id, update.available_version)
+    install_attempts: list[dict] = []
+    success = False
+    after: dict = {'state': 'unknown'}
+    after_attrs: dict = {}
+    observations: list[dict] = []
+    op.state = 'Installing'; db.flush()
+    for service_attempt in range(1, 4):
+        attempt_exception = None
+        try:
+            response = adapter.post('/api/services/update/install', payload)
+            install_attempts.append({'attempt': service_attempt, 'service_response': 'ok'})
+        except Exception as exc:
+            # Add-ons such as Cloudflared can interrupt their own tunnel/API path while the update is actually accepted.
+            # Poll before reporting; do not mark a persistent 5xx as success just because preflight passed.
+            attempt_exception = {'type': type(exc).__name__, 'message': str(exc)[:300]}
+            post_exception = attempt_exception
+            install_attempts.append({'attempt': service_attempt, 'error_type': attempt_exception['type'], 'error': attempt_exception['message']})
+        op.state = 'Validating'; db.flush()
+        success, after, after_attrs, attempt_observations = _poll_update_install_result(adapter, update.entity_id, update.available_version)
+        observations.extend(attempt_observations)
+        observed_state = after.get('state') not in {None, 'unknown'}
+        made_progress = (
+            bool(after_attrs.get('in_progress'))
+            or (after_attrs.get('installed_version') is not None and after_attrs.get('installed_version') != attrs.get('installed_version'))
+            or (observed_state and after.get('state') in {'installing', 'updating'})
+        )
+        if success or made_progress or not attempt_exception:
+            break
+        if service_attempt < 3:
+            op.state = f'Retrying install after Home Assistant error ({service_attempt}/3)'; db.flush()
     restart_repairs = _restart_repair_issues(adapter) if success else []
     if success:
         update.installation_state = 'installed'
-        update.installed_version = update.available_version
+        update.installed_version = after_attrs.get('installed_version') or update.available_version
+        update.available_version = after_attrs.get('latest_version') or update.available_version
+        update.raw_json = json.dumps(after or {}, default=str)[:20000]
         update.approval_state = 'not_required'
         if restart_repairs:
             op.state = 'Installed — restart required'
@@ -303,14 +457,25 @@ def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: 
             op.state = 'Succeeded'
             op.status = 'succeeded'
     elif post_exception:
-        op.state = 'Accepted by Home Assistant; verification pending'
-        op.status = 'accepted'
+        observed_state = after.get('state') not in {None, 'unknown'}
+        made_progress = (
+            bool(after_attrs.get('in_progress'))
+            or (after_attrs.get('installed_version') is not None and after_attrs.get('installed_version') != attrs.get('installed_version'))
+            or (observed_state and after.get('state') in {'installing', 'updating'})
+        )
+        if made_progress:
+            op.state = 'Accepted by Home Assistant; verification pending'
+            op.status = 'accepted'
+        else:
+            op.state = 'Load failed — Home Assistant rejected update install'
+            op.status = 'manual_intervention_required'
+            create_notification(db, severity='critical', title=f'Home Assistant update failed: {inst.friendly_name} / {update.component}', body=f'Install service failed for {update.entity_id}; version stayed at {attrs.get("installed_version") or "unknown"}. Check the instance directly.', instance_id=inst.id, update_id=update.id)
     else:
         op.state = 'Manual Intervention Required'
         op.status = 'manual_intervention_required'
         create_notification(db, severity='critical', title=f'Home Assistant update needs manual validation: {inst.friendly_name} / {update.component}', body=f'Install service returned but update still appears pending for {update.entity_id}.', instance_id=inst.id, update_id=update.id)
     op.ended_at = now()
-    op.details_json = json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': update.available_version, 'backup_requested': bool(payload.get('backup')), 'service_payload': payload, 'service_response': response, 'post_exception': post_exception, 'restart_repairs': restart_repairs if 'restart_repairs' in locals() else [], 'before': {'state': before.get('state'), 'installed_version': attrs.get('installed_version'), 'latest_version': attrs.get('latest_version')}, 'after': {'state': after.get('state'), 'installed_version': after_attrs.get('installed_version'), 'latest_version': after_attrs.get('latest_version'), 'in_progress': after_attrs.get('in_progress')}, 'validation_observations': observations[-8:]})
+    op.details_json = json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': payload.get('version'), 'backup_requested': bool(payload.get('backup')), 'service_payload': payload, 'service_response': response, 'post_exception': post_exception, 'install_attempts': install_attempts, 'restart_repairs': restart_repairs if 'restart_repairs' in locals() else [], 'before': {'state': before.get('state'), 'installed_version': attrs.get('installed_version'), 'latest_version': attrs.get('latest_version'), 'in_progress': attrs.get('in_progress'), 'update_percentage': attrs.get('update_percentage')}, 'after': {'state': after.get('state'), 'installed_version': after_attrs.get('installed_version'), 'latest_version': after_attrs.get('latest_version'), 'in_progress': after_attrs.get('in_progress'), 'update_percentage': after_attrs.get('update_percentage')}, 'validation_observations': observations[-12:]})
     append_vault_update_log(
         f'{ct_now()} — {inst.friendly_name} — {update.component}',
         [

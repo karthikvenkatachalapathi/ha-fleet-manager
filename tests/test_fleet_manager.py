@@ -1,4 +1,4 @@
-import base64, os, tempfile
+import base64, os, tempfile, json
 from pathlib import Path
 from fastapi.testclient import TestClient
 
@@ -7,7 +7,7 @@ os.environ['FLEET_ADMIN_PASSWORD'] = 'test-password'
 os.environ['DATABASE_URL'] = 'sqlite:///' + str(Path(tempfile.mkdtemp(prefix='hafm-test-')) / 'test.db')
 
 from fleet_manager.db import Base, engine, SessionLocal
-from fleet_manager.models import Instance, UpdateRecord, Notification, User, AuditEvent
+from fleet_manager.models import Instance, UpdateRecord, Notification, User, AuditEvent, PolicySetting
 from fleet_manager.services.credentials import CredentialService
 from fleet_manager.services.automation import review_update_for_auto, monitor_and_act, install_update
 from fleet_manager.services.release_parser import parse_breaking_sections
@@ -90,6 +90,48 @@ def test_monitor_creates_manual_notification_for_core_update():
     db.close()
 
 
+def test_create_notification_dispatches_every_enabled_channel(monkeypatch):
+    import fleet_manager.services.automation as automod
+    db = SessionLocal()
+    db.query(PolicySetting).filter_by(key='notification_settings').delete()
+    db.add(PolicySetting(key='notification_settings', value_json=json.dumps({
+        'ntfy_enabled': True,
+        'pushover_enabled': True,
+        'email_enabled': True,
+        'telegram_enabled': True,
+    }), description='test'))
+    db.commit()
+    sent = []
+    monkeypatch.setattr(automod, '_send_ntfy', lambda cfg, title, body: sent.append(('ntfy', title, body)))
+    monkeypatch.setattr(automod, '_send_pushover', lambda cfg, title, body: sent.append(('pushover', title, body)))
+    monkeypatch.setattr(automod, '_send_email', lambda cfg, title, body: sent.append(('email', title, body)))
+    monkeypatch.setattr(automod, '_send_telegram', lambda cfg, title, body: sent.append(('telegram', title, body)))
+    n = automod.create_notification(db, severity='warning', title='Fleet alert', body='Body text')
+    db.commit()
+    assert n.id is not None
+    assert {row[0] for row in sent} == {'ntfy', 'pushover', 'email', 'telegram'}
+    assert db.query(AuditEvent).filter_by(action='notification_dispatch_sent', resource_id=str(n.id)).count() == 4
+    db.close()
+
+
+def test_create_notification_dispatch_failure_is_audited_not_blocking(monkeypatch):
+    import fleet_manager.services.automation as automod
+    db = SessionLocal()
+    db.query(PolicySetting).filter_by(key='notification_settings').delete()
+    db.add(PolicySetting(key='notification_settings', value_json=json.dumps({'pushover_enabled': True}), description='test'))
+    db.commit()
+    def fail(*_):
+        raise RuntimeError('bad token')
+    monkeypatch.setattr(automod, '_send_pushover', fail)
+    n = automod.create_notification(db, severity='critical', title='Fleet alert fail', body='Body text')
+    db.commit()
+    assert n.id is not None
+    ev = db.query(AuditEvent).filter_by(action='notification_dispatch_failed', resource_id=str(n.id)).one()
+    assert 'pushover' in ev.metadata_json
+    assert 'bad token' in ev.metadata_json
+    db.close()
+
+
 def test_policy_setting_model_roundtrip():
     from fleet_manager.models import PolicySetting
     db = SessionLocal()
@@ -106,6 +148,31 @@ def test_login_rate_limit_state_blocks_after_failures():
     key = 'test:admin@example.local'
     appmod.LOGIN_FAILURES[key] = [appmod.datetime.now(appmod.timezone.utc)] * appmod.LOGIN_MAX_FAILURES
     assert len(appmod.LOGIN_FAILURES[key]) == appmod.LOGIN_MAX_FAILURES
+
+
+def test_oidc_callback_provider_400_returns_friendly_error(monkeypatch):
+    from fleet_manager import app as appmod
+    from fleet_manager.models import PolicySetting
+    db = SessionLocal()
+    db.query(PolicySetting).filter_by(key='oidc_settings').delete()
+    db.add(PolicySetting(key='oidc_settings', value_json=json.dumps({'enabled': True, 'issuer_url': 'https://auth.example/application/o/app/', 'client_id': 'client', 'client_secret': 'secret', 'scopes': 'openid email profile'}), description='test'))
+    db.commit(); db.close()
+
+    monkeypatch.setattr(appmod, 'oidc_discovery', lambda issuer: {'token_endpoint': 'https://auth.example/application/o/token/', 'userinfo_endpoint': 'https://auth.example/userinfo'})
+    class FakeClient:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, url, data=None, headers=None):
+            return appmod.httpx.Response(400, text='invalid_grant: redirect_uri mismatch', request=appmod.httpx.Request('POST', url))
+        def get(self, *a, **k): raise AssertionError('userinfo should not be called')
+    monkeypatch.setattr(appmod.httpx, 'Client', FakeClient)
+    client = TestClient(appmod.app)
+    r = client.get('/api/auth/oidc/callback?code=bad&state=s1', cookies={'hafm_oidc_state': 's1'})
+    assert r.status_code == 502
+    assert 'Sign-in failed' in r.text
+    assert 'OIDC token exchange failed' in r.text
+    assert 'secret' not in r.text
 
 def test_auto_policy_can_disable_or_narrow_automatic_updates():
     db = SessionLocal()
@@ -144,6 +211,11 @@ def test_fleet_manager_ui_has_unrestricted_update_actions_and_oidc_settings():
     assert 'deleteInstance' in html
     assert 'bulkButton' in html
     assert 'data-label=\"Update\"' in html
+    assert 'actionResultHtml' in html
+    assert 'Verified updated' in html
+    assert 'Open update in Home Assistant' in html
+    assert 'Home Assistant error' in html
+    assert 'Open in HA' in html
     assert 'selectCell' in html
     assert 'overflow-x:hidden!important' in html
     assert 'width:14px!important' in html
@@ -232,17 +304,51 @@ def test_install_update_timeout_returns_accepted_not_exception(monkeypatch):
     class FakeCreds:
         def get_instance_token(self, db_, instance_id): return 'token'
     class FakeAdapter:
-        def __init__(self, instance, token): pass
-        def get(self, path): return {'state':'on','attributes':{'installed_version':'1.0','latest_version':'1.1','supported_features':0}}
+        def __init__(self, instance, token): self.gets = 0
+        def get(self, path):
+            self.gets += 1
+            if self.gets == 1:
+                return {'state':'on','attributes':{'installed_version':'1.0','latest_version':'1.1','supported_features':0}}
+            return {'state':'on','attributes':{'installed_version':'1.0','latest_version':'1.1','supported_features':0,'in_progress':True}}
         def post(self, path, payload): raise TimeoutError('held open')
 
     import fleet_manager.services.automation as automod
     monkeypatch.setattr(automod, 'CredentialService', FakeCreds)
     monkeypatch.setattr(automod, 'HomeAssistantAdapter', FakeAdapter)
     monkeypatch.setattr(automod, 'append_vault_update_log', lambda *a, **k: None)
+    monkeypatch.setattr(automod, '_poll_update_install_result', lambda *a, **k: (False, {'state':'on'}, {'installed_version':'1.0','latest_version':'1.1','in_progress':True}, [{'attempt':0,'in_progress':True}]))
     op = automod.install_update(db, inst, upd, actor='test')
     assert op.status == 'accepted'
     assert 'verification pending' in op.state
+    db.close()
+
+
+def test_install_update_500_without_progress_requires_manual_intervention(monkeypatch):
+    db = SessionLocal()
+    inst = Instance(friendly_name='Richmond Home', url='http://ha.local')
+    db.add(inst); db.flush()
+    upd = UpdateRecord(instance_id=inst.id, entity_id='update.music_assistant_server_update', component='Music Assistant', category='Add-on', installed_version='2.9.11', available_version='2.9.12', installation_state='available')
+    db.add(upd); db.commit()
+
+    class FakeCreds:
+        def get_instance_token(self, db_, instance_id): return 'token'
+    class FakeAdapter:
+        def __init__(self, instance, token): pass
+        def get(self, path):
+            return {'state':'on','attributes':{'installed_version':'2.9.11','latest_version':'2.9.12','supported_features':8,'in_progress':False}}
+        def post(self, path, payload): raise RuntimeError('500 Internal Server Error')
+
+    import fleet_manager.services.automation as automod
+    monkeypatch.setattr(automod, 'CredentialService', FakeCreds)
+    monkeypatch.setattr(automod, 'HomeAssistantAdapter', FakeAdapter)
+    monkeypatch.setattr(automod, 'append_vault_update_log', lambda *a, **k: None)
+    monkeypatch.setattr(automod, '_poll_update_install_result', lambda *a, **k: (False, {'state':'on'}, {'installed_version':'2.9.11','latest_version':'2.9.12','in_progress':False}, [{'attempt':0,'in_progress':False}]))
+    op = automod.install_update(db, inst, upd, actor='test')
+    assert op.status == 'manual_intervention_required'
+    assert len(json.loads(op.details_json)['install_attempts']) == 3
+    assert 'Load failed' in op.state
+    db.flush()
+    assert db.query(Notification).filter_by(update_record_id=upd.id, severity='critical').count() == 1
     db.close()
 
 
