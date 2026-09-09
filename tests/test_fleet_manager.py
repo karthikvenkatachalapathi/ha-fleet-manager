@@ -11,7 +11,7 @@ from fleet_manager.models import Instance, UpdateRecord, Notification, User, Aud
 from fleet_manager.services.credentials import CredentialService
 from fleet_manager.services.automation import review_update_for_auto, monitor_and_act, install_update
 from fleet_manager.services.release_parser import parse_breaking_sections
-from fleet_manager.services.ha_adapter import categorize, risk_for
+from fleet_manager.services.ha_adapter import categorize, risk_for, sync_updates
 
 
 def setup_module(module):
@@ -44,6 +44,38 @@ def test_core_update_requires_approval():
     assert risk == 'high'
     assert critical is True
     assert decision == 'approval_required'
+
+
+def test_sync_updates_retires_cached_updates_missing_from_live_home_assistant(monkeypatch):
+    import fleet_manager.services.ha_adapter as adaptermod
+
+    db = SessionLocal()
+    inst = Instance(friendly_name='Fresh Fleet', url='http://ha.local')
+    db.add(inst); db.flush()
+    stale = UpdateRecord(
+        instance_id=inst.id,
+        entity_id='update.removed_integration',
+        component='Removed Integration',
+        installed_version='1.0',
+        available_version='2.0',
+        installation_state='available',
+        approval_state='required',
+        critical_state=True,
+        skip_state='none',
+    )
+    db.add(stale); db.commit()
+
+    class FakeAdapter:
+        def __init__(self, *_): pass
+        def discover_updates(self): return []
+
+    monkeypatch.setattr(adaptermod, 'HomeAssistantAdapter', FakeAdapter)
+    assert sync_updates(db, inst, 'token') == 0
+    assert stale.installation_state == 'unavailable'
+    assert stale.approval_state == 'not_required'
+    assert stale.critical_state is False
+    assert inst.available_updates == 0
+    db.close()
 
 
 def test_approval_is_version_bound_in_plan_summary():
@@ -87,6 +119,134 @@ def test_monitor_creates_manual_notification_for_core_update():
     n = db.query(Notification).filter(Notification.title.like('%Manual Home Assistant update required%')).one_or_none()
     assert n is not None
     assert n.severity == 'warning'
+    db.close()
+
+
+def test_review_update_notification_dedupes_available_update_alerts():
+    from fleet_manager.services.automation import mark_review_update_notification
+    db = SessionLocal()
+    inst = Instance(friendly_name='NotifyReview', url='http://ha.local')
+    db.add(inst); db.flush()
+    upd = UpdateRecord(instance_id=inst.id, entity_id='update.hacs_addon', component='HACS Add-on', category='Update Entity', installed_version='1.0', available_version='1.1', approval_state='not_required', installation_state='available', skip_state='none')
+    db.add(upd); db.commit()
+    assert mark_review_update_notification(db, inst, upd, ['missing_or_non_public_release_url']) is True
+    assert mark_review_update_notification(db, inst, upd, ['missing_or_non_public_release_url']) is False
+    n = db.query(Notification).filter(Notification.title.like('%Home Assistant update available%'), Notification.update_record_id == upd.id).one_or_none()
+    assert n is not None
+    assert n.severity == 'info'
+    assert 'missing_or_non_public_release_url' in n.body
+    db.close()
+
+
+def test_monitor_consolidates_notifications_across_instances(monkeypatch):
+    import fleet_manager.services.automation as automod
+    db = SessionLocal()
+    db.query(PolicySetting).filter_by(key='notification_settings').delete()
+    db.add(PolicySetting(key='notification_settings', value_json=json.dumps({'pushover_enabled': True}), description='test'))
+    inst1 = Instance(friendly_name='Consolidated A', url='http://ha-a.local')
+    inst2 = Instance(friendly_name='Consolidated B', url='http://ha-b.local')
+    db.add_all([inst1, inst2]); db.flush()
+    db.add_all([
+        UpdateRecord(instance_id=inst1.id, entity_id='update.core_a', component='Home Assistant Core', category='Core', installed_version='1.0', available_version='1.1', approval_state='required', installation_state='available', skip_state='none', critical_state=True, risk_level='high'),
+        UpdateRecord(instance_id=inst2.id, entity_id='update.addon_b', component='Safe Add-on', category='Update Entity', installed_version='2.0', available_version='2.1', approval_state='not_required', installation_state='available', skip_state='none'),
+    ])
+    db.commit()
+    class FakeCredentials:
+        def get_instance_token(self, *_):
+            return 'token'
+    sent = []
+    monkeypatch.setattr(automod, 'CredentialService', FakeCredentials)
+    monkeypatch.setattr(automod, 'persist_instance_health', lambda *_: None)
+    monkeypatch.setattr(automod, 'sync_updates', lambda *_: None)
+    monkeypatch.setattr(automod, '_send_pushover', lambda cfg, title, body: sent.append((title, body)))
+    summary = automod.monitor_and_act(db, auto_execute=False, actor='test')
+    db.commit()
+    consolidated = db.query(Notification).filter_by(title='Home Assistant Fleet Manager update summary', status='open').one_or_none()
+    assert consolidated is not None
+    assert 'Instance | What needs update | Current → New | Risk category' in consolidated.body
+    assert 'Consolidated A | Home Assistant Core | 1.0 → 1.1 | manual/high-risk' in consolidated.body
+    assert 'Consolidated B | Safe Add-on | 2.0 → 2.1 | low' in consolidated.body
+    assert 'Review reason' not in consolidated.body
+    assert not db.query(Notification).filter(Notification.title.like('Manual Home Assistant update required:%'), Notification.instance_id.in_([inst1.id, inst2.id])).all()
+    assert len([s for s in sent if s[0] == 'Home Assistant Fleet Manager update summary']) == 1
+    assert summary['manual_notifications'] == 1
+    db.close()
+
+
+def test_monitor_flushes_fresh_sync_before_building_notification(monkeypatch):
+    """Completed firmware disappears while a newly found update appears in the same run."""
+    import fleet_manager.services.automation as automod
+    db = SessionLocal()
+    db.query(PolicySetting).filter_by(key='notification_settings').delete()
+    db.add(PolicySetting(key='notification_settings', value_json=json.dumps({'pushover_enabled': True}), description='test'))
+    inst = Instance(friendly_name='Fresh Snapshot HA', url='http://fresh.local')
+    db.add(inst); db.flush()
+    stale = UpdateRecord(
+        instance_id=inst.id,
+        entity_id='update.stale_firmware',
+        component='Stale Firmware',
+        category='Firmware',
+        installed_version='1.0',
+        available_version='1.1',
+        approval_state='required',
+        installation_state='available',
+        skip_state='none',
+        critical_state=True,
+        risk_level='high',
+    )
+    db.add(stale); db.commit()
+
+    class FakeCredentials:
+        def get_instance_token(self, *_):
+            return 'token'
+
+    def fake_sync(db_, target, _token):
+        if target.id != inst.id:
+            return 0
+        stale.installed_version = '1.1'
+        stale.available_version = '1.1'
+        stale.installation_state = 'current'
+        stale.approval_state = 'not_required'
+        db_.add(UpdateRecord(
+            instance_id=inst.id,
+            entity_id='update.new_music_assistant',
+            component='New Music Assistant',
+            category='Update Entity',
+            installed_version='2.10.1',
+            available_version='2.10.2',
+            approval_state='not_required',
+            installation_state='available',
+            skip_state='none',
+            risk_level='low',
+        ))
+        return 1
+
+    sent = []
+    monkeypatch.setattr(automod, 'CredentialService', FakeCredentials)
+    monkeypatch.setattr(automod, 'persist_instance_health', lambda *_: None)
+    monkeypatch.setattr(automod, 'sync_updates', fake_sync)
+    monkeypatch.setattr(automod, '_send_pushover', lambda cfg, title, body: sent.append((title, body)))
+    automod.monitor_and_act(db, auto_execute=False, actor='test')
+    db.commit()
+
+    notification = db.query(Notification).filter_by(title='Home Assistant Fleet Manager update summary', status='open').one()
+    assert 'Fresh Snapshot HA | New Music Assistant | 2.10.1 → 2.10.2 | low' in notification.body
+    assert 'Fresh Snapshot HA | Stale Firmware' not in notification.body
+    assert sent
+    db.close()
+
+
+def test_resolve_consolidated_notification_closes_stale_open_summary():
+    from fleet_manager.services.automation import resolve_consolidated_notification
+    db = SessionLocal()
+    title = 'Resolve stale fleet summary'
+    db.add(Notification(severity='info', title=title, body='stale', status='open'))
+    db.commit()
+    assert resolve_consolidated_notification(db, title=title) is True
+    db.commit()
+    row = db.query(Notification).filter_by(title=title).one()
+    assert row.status == 'resolved'
+    assert row.acknowledged_at is not None
     db.close()
 
 
@@ -189,11 +349,54 @@ def test_auto_policy_can_disable_or_narrow_automatic_updates():
     db.close()
 
 
+def test_poll_does_not_finish_while_home_assistant_still_reports_in_progress(monkeypatch):
+    from fleet_manager.services import automation as automod
+
+    class FakeAdapter:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, _path):
+            self.calls += 1
+            if self.calls == 1:
+                return {'state': 'on', 'attributes': {'installed_version': '2.0', 'latest_version': '2.0', 'in_progress': True}}
+            return {'state': 'off', 'attributes': {'installed_version': '2.0', 'latest_version': '2.0', 'in_progress': False}}
+
+    adapter = FakeAdapter()
+    monkeypatch.setattr(automod.time, 'sleep', lambda _seconds: None)
+    success, _after, attrs, observations = automod._poll_update_install_result(adapter, 'update.example', '2.0', attempts=2, delay=0)
+    assert success is True
+    assert adapter.calls == 2
+    assert attrs['in_progress'] is False
+    assert [row['in_progress'] for row in observations] == [True, False]
+
+
+def test_serialize_update_treats_updating_state_as_in_progress():
+    from fleet_manager.app import serialize_update
+
+    update = UpdateRecord(
+        instance_id=1,
+        entity_id='update.state_only_progress',
+        component='State-only progress',
+        installed_version='1.0',
+        available_version='1.1',
+        installation_state='available',
+        raw_json=json.dumps({'state': 'updating', 'attributes': {'installed_version': '1.0', 'latest_version': '1.1'}}),
+    )
+    assert serialize_update(update)['in_progress'] is True
+
+
 def test_fleet_manager_ui_has_unrestricted_update_actions_and_oidc_settings():
     html = Path(__file__).resolve().parents[1].joinpath('fleet_manager/static/index.html').read_text()
     assert "bulkAction('update')" in html
     assert "skipOne(${u.id})" in html
     assert "sameVersion(u)" in html
+    assert "function updateIsVisible(u){return u.in_progress||!sameVersion(u)}" in html
+    assert "function updateIsPending(u){return u.in_progress||(u.installation_state==='available'&&u.skip_state!=='skipped')}" in html
+    assert "data.updates.filter(updateIsVisible)" in html
+    assert "await refreshInitialFleet()" in html
+    assert "api('/api/sync-all',{method:'POST'})" in html
+    assert html.index("api('/api/sync-all',{method:'POST'})") < html.index("await loadCore()", html.index('async function refreshInitialFleet'))
     assert 'Single sign-on' in html
     assert 'Email or username' in html
     assert '/api/auth/oidc/start' in html
@@ -316,10 +519,50 @@ def test_install_update_timeout_returns_accepted_not_exception(monkeypatch):
     monkeypatch.setattr(automod, 'CredentialService', FakeCreds)
     monkeypatch.setattr(automod, 'HomeAssistantAdapter', FakeAdapter)
     monkeypatch.setattr(automod, 'append_vault_update_log', lambda *a, **k: None)
-    monkeypatch.setattr(automod, '_poll_update_install_result', lambda *a, **k: (False, {'state':'on'}, {'installed_version':'1.0','latest_version':'1.1','in_progress':True}, [{'attempt':0,'in_progress':True}]))
+    monkeypatch.setattr(automod, '_poll_update_install_result', lambda *a, **k: (False, {'state':'on','attributes':{'installed_version':'1.0','latest_version':'1.1','in_progress':True}}, {'installed_version':'1.0','latest_version':'1.1','in_progress':True}, [{'attempt':0,'in_progress':True}]))
     op = automod.install_update(db, inst, upd, actor='test')
     assert op.status == 'accepted'
     assert 'verification pending' in op.state
+    raw = json.loads(upd.raw_json)
+    assert raw['attributes']['in_progress'] is True
+    db.close()
+
+
+def test_install_update_retries_latest_when_explicit_version_is_rejected(monkeypatch):
+    db = SessionLocal()
+    inst = Instance(friendly_name='FallbackHA', url='http://ha.local')
+    db.add(inst); db.flush()
+    upd = UpdateRecord(instance_id=inst.id, entity_id='update.version_fussy', component='Version Fussy Add-on', category='Add-on', installed_version='1.0', available_version='1.1', installation_state='available')
+    db.add(upd); db.commit()
+    calls = []
+
+    class FakeCreds:
+        def get_instance_token(self, db_, instance_id): return 'token'
+    class FakeAdapter:
+        def __init__(self, instance, token): pass
+        def get(self, path):
+            return {'state':'on','attributes':{'installed_version':'1.0','latest_version':'1.1','supported_features':0,'in_progress':False}}
+        def post(self, path, payload):
+            calls.append(payload.copy())
+            if 'version' in payload:
+                raise RuntimeError('500 Internal Server Error')
+            return {'ok': True}
+
+    import fleet_manager.services.automation as automod
+    monkeypatch.setattr(automod, 'CredentialService', FakeCreds)
+    monkeypatch.setattr(automod, 'HomeAssistantAdapter', FakeAdapter)
+    monkeypatch.setattr(automod, 'append_vault_update_log', lambda *a, **k: None)
+    def fake_poll(*a, **k):
+        if any('version' not in call for call in calls):
+            return True, {'state':'off','attributes':{'installed_version':'1.1','latest_version':'1.1','in_progress':False}}, {'installed_version':'1.1','latest_version':'1.1','in_progress':False}, [{'attempt':0,'in_progress':False}]
+        return False, {'state':'on','attributes':{'installed_version':'1.0','latest_version':'1.1','in_progress':False}}, {'installed_version':'1.0','latest_version':'1.1','in_progress':False}, [{'attempt':0,'in_progress':False}]
+    monkeypatch.setattr(automod, '_poll_update_install_result', fake_poll)
+    op = automod.install_update(db, inst, upd, actor='test')
+    assert op.status == 'succeeded'
+    assert calls == [
+        {'entity_id': 'update.version_fussy', 'version': '1.1'},
+        {'entity_id': 'update.version_fussy'},
+    ]
     db.close()
 
 
@@ -345,7 +588,7 @@ def test_install_update_500_without_progress_requires_manual_intervention(monkey
     monkeypatch.setattr(automod, '_poll_update_install_result', lambda *a, **k: (False, {'state':'on'}, {'installed_version':'2.9.11','latest_version':'2.9.12','in_progress':False}, [{'attempt':0,'in_progress':False}]))
     op = automod.install_update(db, inst, upd, actor='test')
     assert op.status == 'manual_intervention_required'
-    assert len(json.loads(op.details_json)['install_attempts']) == 3
+    assert len(json.loads(op.details_json)['install_attempts']) == 6
     assert 'Load failed' in op.state
     db.flush()
     assert db.query(Notification).filter_by(update_record_id=upd.id, severity='critical').count() == 1

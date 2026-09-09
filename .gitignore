@@ -22,6 +22,7 @@ tmp/
 cache/
 backups/
 uploads/
+docs/home-assistant-update-automation.md
 
 # Local editor/OS
 .DS_Store

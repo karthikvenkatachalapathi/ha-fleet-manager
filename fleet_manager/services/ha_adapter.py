@@ -219,6 +219,9 @@ def sync_updates(db: Session, inst: Instance, token: str) -> int:
         row.risk_level=risk; row.critical_state=critical_state; row.manual_action_required=manual_required; row.approval_state='required' if is_pending and approval=='approval_required' else 'not_required'
         row.installation_state='skipped' if is_skipped else ('available' if is_pending else 'current'); row.skip_state='skipped' if is_skipped else 'none'; row.restart_required=category in {'Core','OS','Supervisor'}; row.policy_decision=approval; row.policy_explanation=explanation
         row.last_discovered=now(); row.raw_json=json.dumps(u.get('raw') or {}, default=str)[:20000]
+    for row in db.query(UpdateRecord).filter_by(instance_id=inst.id).all():
+        if row.entity_id not in seen:
+            row.installation_state='unavailable'; row.approval_state='not_required'; row.critical_state=False; row.manual_action_required=False
     inst.available_updates=pending; inst.critical_updates=critical; inst.pending_approvals=approvals; inst.last_update_scan=now()
     if inst.connectivity_state == 'online' and critical: inst.health_state='warning'
     return pending

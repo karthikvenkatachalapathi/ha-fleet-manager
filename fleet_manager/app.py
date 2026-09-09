@@ -12,7 +12,7 @@ from collections import defaultdict
 from urllib.parse import urlencode
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
@@ -125,12 +125,10 @@ def ensure_app_defaults(db: Session):
         if 'display_name' not in existing:
             db.execute(text('ALTER TABLE users ADD COLUMN display_name VARCHAR(200)'))
     if db.query(Schedule).count() == 0:
-        db.add(Schedule(name='Fleet update check', kind='update_discovery', cron='every 6h', enabled=True))
+        db.add(Schedule(name='Fleet update check', kind='monitor_and_act', cron='every 6h', enabled=True))
     else:
         for sched in db.query(Schedule).filter(Schedule.name.in_(['Default monitor cadence','Fleet update check'])).all():
             sched.name = 'Fleet update check'
-            if sched.kind == 'monitor_and_act':
-                sched.kind = 'update_discovery'
             if sched.cron == '0 */6 * * *':
                 sched.cron = 'every 6h'
     defaults = {
@@ -190,7 +188,10 @@ async def schedule_loop():
                 sched = db.query(Schedule).filter(Schedule.enabled == True, Schedule.kind.in_(['update_discovery','monitor_and_act'])).order_by(Schedule.id).first()
                 if sched:
                     interval = parse_schedule_seconds(sched.cron)
-                    due = not sched.last_run_at or (now() - sched.last_run_at).total_seconds() >= interval
+                    last_run_at = sched.last_run_at
+                    if last_run_at and last_run_at.tzinfo is None:
+                        last_run_at = last_run_at.replace(tzinfo=timezone.utc)
+                    due = not last_run_at or (now() - last_run_at).total_seconds() >= interval
                     if due:
                         if sched.kind == 'monitor_and_act':
                             summary = monitor_and_act(db, auto_execute=False, actor='scheduler')
@@ -292,12 +293,12 @@ def serialize_update(u: UpdateRecord):
         attrs = raw.get('attributes') or {}
     except Exception:
         raw = {}; attrs = {}
-    progress = attrs.get('progress') or attrs.get('update_percentage') or attrs.get('percent')
+    progress = next((attrs.get(k) for k in ('progress','update_percentage','percent') if attrs.get(k) is not None), None)
     try:
         progress = None if progress is None else max(0, min(100, int(float(progress))))
     except Exception:
         progress = None
-    in_progress = bool(attrs.get('in_progress')) or raw.get('state') == 'installing'
+    in_progress = bool(attrs.get('in_progress')) or raw.get('state') in {'installing', 'updating'}
     return {'id':u.id,'instance_id':u.instance_id,'provider':u.provider,'entity_id':u.entity_id,'component':u.component,'category':u.category,'installed_version':u.installed_version,'available_version':u.available_version,'release_url':u.release_url,'release_title':u.release_title,'release_notes':u.release_notes,'breaking_excerpt':u.breaking_excerpt,'severity':u.severity,'risk_level':u.risk_level,'critical_state':u.critical_state,'breaking_state':u.breaking_state,'restart_required':u.restart_required,'manual_action_required':u.manual_action_required,'approval_state':u.approval_state,'installation_state':u.installation_state,'skip_state':u.skip_state,'last_discovered':u.last_discovered.isoformat() if u.last_discovered else None,'policy_decision':u.policy_decision,'policy_explanation':u.policy_explanation,'in_progress':in_progress,'progress':progress}
 
 def serialize_user(u: User):
@@ -408,6 +409,13 @@ def external_base_url(request: Request) -> str:
     proto = request.headers.get('x-forwarded-proto') or request.url.scheme
     host = request.headers.get('x-forwarded-host') or request.headers.get('host')
     return f'{proto}://{host}'
+
+def oidc_error_page(message: str, *, status_code: int = 502) -> HTMLResponse:
+    safe = re.sub(r'[<>&]', lambda m: {'<':'&lt;','>':'&gt;','&':'&amp;'}[m.group(0)], message)[:1000]
+    return HTMLResponse(
+        f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign-in failed</title><style>body{{font:15px system-ui;margin:0;background:#0a0a0a;color:#f2f2f2;display:grid;place-items:center;min-height:100vh}}.card{{max-width:680px;margin:24px;padding:24px;border:1px solid #333;border-radius:14px;background:#141414}}a{{color:#58a6ff}}</style></head><body><main class="card"><h1>Sign-in failed</h1><p>{safe}</p><p><a href="/">Return to Fleet Manager</a></p></main></body></html>''',
+        status_code=status_code,
+    )
 
 @app.get('/')
 def index(): return FileResponse(ROOT / 'fleet_manager' / 'static' / 'index.html')
@@ -582,12 +590,23 @@ def oidc_callback(request: Request, code: str | None = None, state: str | None =
     meta = oidc_discovery(value.get('issuer_url') or '')
     redirect_uri = external_base_url(request) + '/api/auth/oidc/callback'
     with httpx.Client(follow_redirects=True, timeout=20, trust_env=False) as client:
-        token_resp = client.post(meta['token_endpoint'], data={'grant_type': 'authorization_code', 'code': code, 'redirect_uri': redirect_uri, 'client_id': value['client_id'], 'client_secret': value['client_secret']}, headers={'Accept': 'application/json'})
-        token_resp.raise_for_status()
-        token = token_resp.json()
-        user_resp = client.get(meta['userinfo_endpoint'], headers={'Authorization': f"Bearer {token.get('access_token')}", 'Accept': 'application/json'})
-        user_resp.raise_for_status()
-        profile = user_resp.json()
+        try:
+            token_resp = client.post(meta['token_endpoint'], data={'grant_type': 'authorization_code', 'code': code, 'redirect_uri': redirect_uri, 'client_id': value['client_id'], 'client_secret': value['client_secret']}, headers={'Accept': 'application/json'})
+            token_resp.raise_for_status()
+            token = token_resp.json()
+            user_resp = client.get(meta['userinfo_endpoint'], headers={'Authorization': f"Bearer {token.get('access_token')}", 'Accept': 'application/json'})
+            user_resp.raise_for_status()
+            profile = user_resp.json()
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text[:500]
+            audit(db, action='oidc_login_failed', resource_type='auth', result='failed', metadata={'issuer': value.get('issuer_url'), 'status_code': exc.response.status_code, 'redirect_uri': redirect_uri, 'provider_error': body[:220]})
+            db.commit()
+            hint = 'OIDC token exchange failed. Check Authentik redirect URI/client settings.' if str(exc.request.url) == meta.get('token_endpoint') else 'OIDC profile lookup failed.'
+            return oidc_error_page(f'{hint} Provider returned HTTP {exc.response.status_code}: {body}')
+        except (httpx.HTTPError, ValueError) as exc:
+            audit(db, action='oidc_login_failed', resource_type='auth', result='failed', metadata={'issuer': value.get('issuer_url'), 'error': type(exc).__name__, 'redirect_uri': redirect_uri})
+            db.commit()
+            return oidc_error_page(f'OIDC sign-in failed before Fleet Manager could create a session: {type(exc).__name__}')
     email = (profile.get('email') or profile.get('preferred_username') or '').strip().lower()
     if not email or '@' not in email:
         raise HTTPException(403, 'OIDC profile did not provide an email address')
@@ -797,11 +816,40 @@ def fix_repair(data: RepairFixIn, s=Depends(csrf), db: Session = Depends(get_db)
         audit(db, action='repair_fix_failed', resource_type='repair', actor_user_id=s.user_id, resource_id=data.issue_id, instance_id=inst.id, result='failed', metadata={'domain': data.domain, 'issue_id': data.issue_id, 'error': type(exc).__name__})
         db.commit(); raise HTTPException(502, str(exc))
 
+def refresh_pending_update_snapshot(db: Session, update: UpdateRecord, inst: Instance | None):
+    """Refresh one pending update entity so progress/version shown in the UI is not stale DB data."""
+    if not inst or update.installation_state not in {'available', 'installed'}:
+        return
+    try:
+        token = CredentialService().get_instance_token(db, inst.id)
+        raw = HomeAssistantAdapter(inst, token).get(f'/api/states/{update.entity_id}')
+        attrs = raw.get('attributes') or {}
+        installed = attrs.get('installed_version')
+        latest = attrs.get('latest_version')
+        in_progress = bool(attrs.get('in_progress')) or raw.get('state') in {'installing', 'updating'}
+        same_version = installed and latest and installed == latest
+        update.raw_json = json.dumps(raw or {}, default=str)[:20000]
+        update.installed_version = installed or update.installed_version
+        update.available_version = latest or update.available_version
+        if same_version and not in_progress:
+            update.installation_state = 'current'
+            update.approval_state = 'not_required'
+            update.skip_state = 'none'
+        elif raw.get('state') == 'on' and not same_version:
+            update.installation_state = 'available'
+    except Exception:
+        return
+
 @app.get('/api/updates')
 def updates(s=Depends(current_session), db: Session = Depends(get_db)):
     require_permission(s,'view_updates'); inst={i.id:i for i in db.query(Instance).all()}
     rows=[]
-    for u in db.query(UpdateRecord).order_by(UpdateRecord.critical_state.desc(), UpdateRecord.last_discovered.desc()).all():
+    records = db.query(UpdateRecord).order_by(UpdateRecord.critical_state.desc(), UpdateRecord.last_discovered.desc()).all()
+    for u in records:
+        if u.installation_state == 'available' or '"in_progress": true' in (u.raw_json or '').lower():
+            refresh_pending_update_snapshot(db, u, inst.get(u.instance_id))
+    db.flush(); db.commit()
+    for u in records:
         d=serialize_update(u); d['instance']=inst.get(u.instance_id).friendly_name if inst.get(u.instance_id) else None; rows.append(d)
     return rows
 @app.post('/api/deployments')

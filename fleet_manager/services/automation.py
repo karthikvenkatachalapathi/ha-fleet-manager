@@ -297,6 +297,30 @@ def create_notification(db: Session, *, severity: str, title: str, body: str, in
     return n
 
 
+def create_or_update_consolidated_notification(db: Session, *, severity: str, title: str, body: str) -> bool:
+    """Maintain one open fleet-wide alert and dispatch only when its body changes."""
+    existing = db.query(Notification).filter_by(title=title, status='open', instance_id=None, update_record_id=None).one_or_none()
+    if existing:
+        if existing.severity == severity and existing.body == body:
+            return False
+        existing.severity = severity
+        existing.body = body
+        dispatch_notification(db, existing)
+        return True
+    create_notification(db, severity=severity, title=title, body=body, instance_id=None, update_id=None)
+    return True
+
+
+def resolve_consolidated_notification(db: Session, *, title: str) -> bool:
+    """Close the dashboard alert silently when the fresh scan has nothing actionable."""
+    existing = db.query(Notification).filter_by(title=title, status='open', instance_id=None, update_record_id=None).one_or_none()
+    if not existing:
+        return False
+    existing.status = 'resolved'
+    existing.acknowledged_at = now()
+    return True
+
+
 def current_approval_for(db: Session, update: UpdateRecord) -> Approval | None:
     return db.query(Approval).filter_by(update_record_id=update.id, target_version=update.available_version, status='approved').one_or_none()
 
@@ -309,8 +333,44 @@ def _manual_update_line(update: UpdateRecord) -> str:
     return f'- {update.component}: {update.installed_version or "unknown"} → {update.available_version or "unknown"} ({update.category})'
 
 
+def _simple_update_line(inst: Instance, update: UpdateRecord, risk: str | None = None) -> str:
+    risk_category = risk or update.risk_level or update.category or 'unknown'
+    return f'{inst.friendly_name} | {update.component} | {update.installed_version or "unknown"} → {update.available_version or "unknown"} | {risk_category}'
+
+
+def _is_actionable_update(update: UpdateRecord) -> bool:
+    """Reject stale rows and HA entities whose installed/latest versions already match."""
+    if update.installation_state != 'available' or update.skip_state == 'skipped':
+        return False
+    return not (
+        update.installed_version
+        and update.available_version
+        and update.installed_version == update.available_version
+    )
+
+
+def mark_review_update_notification(db: Session, inst: Instance, update: UpdateRecord, reasons: list[str] | None = None) -> bool:
+    """Notify once for an available update that needs user visibility/review."""
+    if not _is_actionable_update(update):
+        return False
+    title = f'Home Assistant update available: {inst.friendly_name} / {update.component}'
+    body = f'{update.component} {update.installed_version or "unknown"} → {update.available_version or "unknown"} is available on {inst.friendly_name} ({update.category}).'
+    clean_reasons = [r for r in (reasons or []) if r and r != 'dry_run_candidate']
+    if clean_reasons:
+        body += '\nReview reason: ' + ', '.join(clean_reasons[:5])
+    exists = db.query(Notification).filter_by(title=title, status='open', update_record_id=update.id).one_or_none()
+    if exists:
+        if exists.body != body:
+            exists.body = body
+            dispatch_notification(db, exists)
+            return True
+        return False
+    create_notification(db, severity='info', title=title, body=body, instance_id=inst.id, update_id=update.id)
+    return True
+
+
 def mark_manual_update_notifications(db: Session, inst: Instance, updates: list[UpdateRecord]) -> bool:
-    pending = [u for u in updates if u.installation_state == 'available' and u.skip_state != 'skipped']
+    pending = [u for u in updates if _is_actionable_update(u)]
     if not pending:
         return False
     if len(pending) == 1:
@@ -353,9 +413,10 @@ def _poll_update_install_result(adapter: HomeAssistantAdapter, entity_id: str, t
             after = adapter.get(f'/api/states/{entity_id}')
             after_attrs = after.get('attributes') or {}
             observations.append({'attempt': attempt, 'state': after.get('state'), 'installed_version': after_attrs.get('installed_version'), 'latest_version': after_attrs.get('latest_version'), 'in_progress': after_attrs.get('in_progress'), 'update_percentage': after_attrs.get('update_percentage')})
-            if target_version and after_attrs.get('installed_version') == target_version:
+            in_progress = bool(after_attrs.get('in_progress')) or after.get('state') in {'installing', 'updating'}
+            if target_version and after_attrs.get('installed_version') == target_version and not in_progress:
                 return True, after, after_attrs, observations
-            if not target_version and after.get('state') != 'on' and not after_attrs.get('in_progress'):
+            if not target_version and after.get('state') != 'on' and not in_progress:
                 return True, after, after_attrs, observations
         except Exception as exc:
             observations.append({'attempt': attempt, 'error_type': type(exc).__name__, 'error': str(exc)[:240]})
@@ -418,27 +479,36 @@ def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: 
     after_attrs: dict = {}
     observations: list[dict] = []
     op.state = 'Installing'; db.flush()
+    payload_variants = [payload]
+    if payload.get('version'):
+        latest_payload = {k: v for k, v in payload.items() if k != 'version'}
+        payload_variants.append(latest_payload)
+    stop_attempts = False
     for service_attempt in range(1, 4):
-        attempt_exception = None
-        try:
-            response = adapter.post('/api/services/update/install', payload)
-            install_attempts.append({'attempt': service_attempt, 'service_response': 'ok'})
-        except Exception as exc:
-            # Add-ons such as Cloudflared can interrupt their own tunnel/API path while the update is actually accepted.
-            # Poll before reporting; do not mark a persistent 5xx as success just because preflight passed.
-            attempt_exception = {'type': type(exc).__name__, 'message': str(exc)[:300]}
-            post_exception = attempt_exception
-            install_attempts.append({'attempt': service_attempt, 'error_type': attempt_exception['type'], 'error': attempt_exception['message']})
-        op.state = 'Validating'; db.flush()
-        success, after, after_attrs, attempt_observations = _poll_update_install_result(adapter, update.entity_id, update.available_version)
-        observations.extend(attempt_observations)
-        observed_state = after.get('state') not in {None, 'unknown'}
-        made_progress = (
-            bool(after_attrs.get('in_progress'))
-            or (after_attrs.get('installed_version') is not None and after_attrs.get('installed_version') != attrs.get('installed_version'))
-            or (observed_state and after.get('state') in {'installing', 'updating'})
-        )
-        if success or made_progress or not attempt_exception:
+        for variant_index, attempt_payload in enumerate(payload_variants, start=1):
+            attempt_exception = None
+            try:
+                response = adapter.post('/api/services/update/install', attempt_payload)
+                install_attempts.append({'attempt': service_attempt, 'variant': variant_index, 'service_payload': attempt_payload, 'service_response': 'ok'})
+            except Exception as exc:
+                # Some Home Assistant update platforms reject an explicit version but accept "install latest".
+                # Poll before reporting; do not mark a persistent 5xx as success just because preflight passed.
+                attempt_exception = {'type': type(exc).__name__, 'message': str(exc)[:300]}
+                post_exception = attempt_exception
+                install_attempts.append({'attempt': service_attempt, 'variant': variant_index, 'service_payload': attempt_payload, 'error_type': attempt_exception['type'], 'error': attempt_exception['message']})
+            op.state = 'Validating'; db.flush()
+            success, after, after_attrs, attempt_observations = _poll_update_install_result(adapter, update.entity_id, update.available_version)
+            observations.extend(attempt_observations)
+            observed_state = after.get('state') not in {None, 'unknown'}
+            made_progress = (
+                bool(after_attrs.get('in_progress'))
+                or (after_attrs.get('installed_version') is not None and after_attrs.get('installed_version') != attrs.get('installed_version'))
+                or (observed_state and after.get('state') in {'installing', 'updating'})
+            )
+            if success or made_progress or not attempt_exception:
+                stop_attempts = True
+                break
+        if stop_attempts:
             break
         if service_attempt < 3:
             op.state = f'Retrying install after Home Assistant error ({service_attempt}/3)'; db.flush()
@@ -466,6 +536,7 @@ def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: 
         if made_progress:
             op.state = 'Accepted by Home Assistant; verification pending'
             op.status = 'accepted'
+            update.raw_json = json.dumps(after or {}, default=str)[:20000]
         else:
             op.state = 'Load failed — Home Assistant rejected update install'
             op.status = 'manual_intervention_required'
@@ -520,6 +591,9 @@ def monitor_and_act(db: Session, *, auto_execute: bool = True, actor: str = 'aut
     job = JobRun(kind='monitor_and_act', status='running', started_at=now(), details_json='{}')
     db.add(job); db.flush()
     summary = {'instances': 0, 'sync_ok': 0, 'sync_failed': 0, 'manual_notifications': 0, 'auto_candidates': 0, 'auto_installed': 0, 'blocked': []}
+    sync_failure_lines: list[str] = []
+    manual_update_lines: list[str] = []
+    review_update_lines: list[str] = []
     try:
         policy = load_auto_policy(db)
         for inst in db.query(Instance).order_by(Instance.id).all():
@@ -528,12 +602,19 @@ def monitor_and_act(db: Session, *, auto_execute: bool = True, actor: str = 'aut
                 token = CredentialService().get_instance_token(db, inst.id)
                 persist_instance_health(db, inst, token)
                 sync_updates(db, inst, token)
+                # SessionLocal disables autoflush. Persist the fresh HA snapshot before querying
+                # actionable rows, otherwise stale rows leak in and newly discovered rows vanish.
+                db.flush()
                 summary['sync_ok'] += 1
             except Exception as exc:
                 summary['sync_failed'] += 1
-                create_notification(db, severity='critical', title=f'Home Assistant sync failed: {inst.friendly_name}', body=f'{type(exc).__name__}: {str(exc)[:300]}', instance_id=inst.id)
+                sync_failure_lines.append(f'- {inst.friendly_name}: {type(exc).__name__}: {str(exc)[:180]}')
                 continue
-            updates = db.query(UpdateRecord).filter_by(instance_id=inst.id, installation_state='available').all()
+            updates = [
+                update
+                for update in db.query(UpdateRecord).filter_by(instance_id=inst.id, installation_state='available').all()
+                if _is_actionable_update(update)
+            ]
             manual_updates: list[UpdateRecord] = []
             auto_review_updates: list[UpdateRecord] = []
             for upd in updates:
@@ -541,8 +622,8 @@ def monitor_and_act(db: Session, *, auto_execute: bool = True, actor: str = 'aut
                     manual_updates.append(upd)
                 else:
                     auto_review_updates.append(upd)
-            if mark_manual_update_notifications(db, inst, manual_updates):
-                summary['manual_notifications'] += 1
+            if manual_updates:
+                manual_update_lines.extend(_simple_update_line(inst, u, 'manual/high-risk') for u in manual_updates)
             for upd in auto_review_updates:
                 ok, reasons, _notes = review_update_for_auto(upd, policy)
                 if ok:
@@ -554,9 +635,25 @@ def monitor_and_act(db: Session, *, auto_execute: bool = True, actor: str = 'aut
                         else:
                             summary['blocked'].append({'instance': inst.friendly_name, 'component': upd.component, 'reason': op.state})
                     else:
+                        review_update_lines.append(_simple_update_line(inst, upd, upd.risk_level or upd.category))
                         summary['blocked'].append({'instance': inst.friendly_name, 'component': upd.component, 'reason': 'dry_run_candidate'})
                 else:
+                    review_update_lines.append(_simple_update_line(inst, upd, upd.risk_level or upd.category))
                     summary['blocked'].append({'instance': inst.friendly_name, 'component': upd.component, 'reason': ','.join(reasons[:5])})
+        notification_sections: list[str] = []
+        if sync_failure_lines:
+            notification_sections.append('Sync failed:\n' + '\n'.join(sync_failure_lines[:12]))
+        update_lines = manual_update_lines + review_update_lines
+        if update_lines:
+            notification_sections.append('Instance | What needs update | Current → New | Risk category\n' + '\n'.join(update_lines[:30]))
+        summary_title = 'Home Assistant Fleet Manager update summary'
+        if notification_sections:
+            severity = 'critical' if sync_failure_lines else ('warning' if manual_update_lines else 'info')
+            body = '\n\n'.join(notification_sections)
+            if create_or_update_consolidated_notification(db, severity=severity, title=summary_title, body=body):
+                summary['manual_notifications'] += 1
+        else:
+            resolve_consolidated_notification(db, title=summary_title)
         job.status = 'succeeded'; job.ended_at = now(); job.details_json = json.dumps(summary, default=str)
         audit(db, action='monitor_and_act_completed', resource_type='job_run', resource_id=job.id, result='success', metadata=summary)
         return summary | {'job_id': job.id}
