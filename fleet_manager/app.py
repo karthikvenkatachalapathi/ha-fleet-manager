@@ -601,7 +601,12 @@ def oidc_start(request: Request, response: Response, db: Session = Depends(get_d
     value = load_json_setting(db, 'oidc_settings', default_oidc_settings())
     if not value.get('enabled'):
         raise HTTPException(404, 'OIDC is not enabled')
-    meta = oidc_discovery(value.get('issuer_url') or '')
+    try:
+        meta = oidc_discovery(value.get('issuer_url') or '')
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        audit(db, action='oidc_login_failed', resource_type='auth', result='failed', metadata={'issuer': value.get('issuer_url'), 'error': type(exc).__name__})
+        db.commit()
+        return oidc_error_page('SSO provider is currently unavailable. Use local sign-in or ask an administrator to verify the OIDC configuration.', status_code=503)
     state = secrets.token_urlsafe(24)
     redirect_uri = external_base_url(request) + '/api/auth/oidc/callback'
     params = {'client_id': value['client_id'], 'response_type': 'code', 'scope': value.get('scopes') or 'openid email profile', 'redirect_uri': redirect_uri, 'state': state}
@@ -616,7 +621,12 @@ def oidc_callback(request: Request, code: str | None = None, state: str | None =
     value = load_json_setting(db, 'oidc_settings', default_oidc_settings())
     if not value.get('enabled'):
         raise HTTPException(404, 'OIDC is not enabled')
-    meta = oidc_discovery(value.get('issuer_url') or '')
+    try:
+        meta = oidc_discovery(value.get('issuer_url') or '')
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        audit(db, action='oidc_login_failed', resource_type='auth', result='failed', metadata={'issuer': value.get('issuer_url'), 'error': type(exc).__name__})
+        db.commit()
+        return oidc_error_page('SSO provider is currently unavailable. Return to Fleet Manager and use local sign-in.', status_code=503)
     redirect_uri = external_base_url(request) + '/api/auth/oidc/callback'
     with httpx.Client(follow_redirects=True, timeout=20, trust_env=False) as client:
         try:

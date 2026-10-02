@@ -341,6 +341,21 @@ def test_oidc_callback_provider_400_returns_friendly_error(monkeypatch):
     assert 'redirect_uri mismatch' not in event.metadata_json
     db.close()
 
+
+def test_oidc_start_discovery_failure_returns_friendly_page(monkeypatch):
+    from fleet_manager import app as appmod
+    db = SessionLocal()
+    db.query(PolicySetting).filter_by(key='oidc_settings').delete()
+    db.add(PolicySetting(key='oidc_settings', value_json=json.dumps({'enabled': True, 'issuer_url': 'https://auth.example/application/o/app/', 'client_id': 'client', 'client_secret': 'secret', 'scopes': 'openid email profile'}), description='test'))
+    db.commit(); db.close()
+    monkeypatch.setattr(appmod, 'oidc_discovery', lambda issuer: (_ for _ in ()).throw(appmod.httpx.ConnectError('private resolver detail')))
+
+    response = TestClient(appmod.app).get('/api/auth/oidc/start')
+    assert response.status_code == 503
+    assert 'SSO provider is currently unavailable' in response.text
+    assert 'private resolver detail' not in response.text
+
+
 def test_auto_policy_can_disable_or_narrow_automatic_updates():
     db = SessionLocal()
     inst = Instance(friendly_name='PolicyTest', url='http://ha.local')
