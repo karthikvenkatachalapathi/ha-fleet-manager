@@ -136,6 +136,19 @@ class Operation(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     details_json: Mapped[str] = mapped_column(Text, default='{}')
+    correlation_id: Mapped[str | None] = mapped_column(String(80), unique=True, index=True, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(200), index=True, nullable=True)
+    request_id: Mapped[str | None] = mapped_column(String(120), index=True, nullable=True)
+    recovery_action: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    batch_id: Mapped[str | None] = mapped_column(String(80), index=True, nullable=True)
+    per_item_json: Mapped[str] = mapped_column(Text, default='{}')
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
 
 class Approval(Base):
     __tablename__ = 'approvals'

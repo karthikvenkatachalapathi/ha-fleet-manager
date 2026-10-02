@@ -31,6 +31,7 @@ from .audit import audit
 from .credentials import CredentialService
 from .ha_adapter import HomeAssistantAdapter, persist_instance_health, sync_updates
 from .release_parser import parse_breaking_sections
+from .reliability import create_operation, safe_append_diagnostic, safe_exception_message
 
 try:
     from zoneinfo import ZoneInfo
@@ -183,7 +184,7 @@ def dispatch_notification(db: Session, notification: Notification) -> dict[str, 
                 resource_id=notification.id,
                 instance_id=notification.instance_id,
                 result='failed',
-                metadata={'channel': channel, 'error': type(exc).__name__, 'message': str(exc)[:160]},
+                metadata={'channel': channel, 'error': type(exc).__name__, 'message': safe_exception_message(exc)},
             )
         else:
             results[channel] = 'sent'
@@ -419,7 +420,7 @@ def _poll_update_install_result(adapter: HomeAssistantAdapter, entity_id: str, t
             if not target_version and after.get('state') != 'on' and not in_progress:
                 return True, after, after_attrs, observations
         except Exception as exc:
-            observations.append({'attempt': attempt, 'error_type': type(exc).__name__, 'error': str(exc)[:240]})
+            observations.append({'attempt': attempt, 'error_type': type(exc).__name__, 'error': safe_exception_message(exc)})
         if attempt < attempts - 1:
             time.sleep(delay)
     return False, after, after_attrs, observations
@@ -457,8 +458,15 @@ def _restart_repair_issues(adapter: HomeAssistantAdapter) -> list[dict]:
 def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: str = 'automation') -> Operation:
     token = CredentialService().get_instance_token(db, inst.id)
     adapter = HomeAssistantAdapter(inst, token)
-    op = Operation(kind='update_install', instance_id=inst.id, state='Preflight', status='running', started_at=now(), details_json=json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': update.available_version, 'actor': actor}))
-    db.add(op); db.flush()
+    target = update.available_version or 'latest'
+    op = create_operation(db, kind='update_install', instance=inst,
+                          idempotency_key=f'update_install:{inst.id}:{update.entity_id}:{target}',
+                          recovery_action='reconcile_install',
+                          details={'update_id': update.id, 'entity_id': update.entity_id, 'target_version': target, 'actor': actor})
+    if op.status in {'succeeded', 'accepted', 'action_required'}:
+        return op
+    op.status = 'running'; op.state = 'Preflight'; op.started_at = now(); op.attempt_count = (op.attempt_count or 0) + 1
+    db.flush()
     before = adapter.get(f'/api/states/{update.entity_id}')
     attrs = before.get('attributes') or {}
     if attrs.get('latest_version') != update.available_version:
@@ -493,7 +501,7 @@ def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: 
             except Exception as exc:
                 # Some Home Assistant update platforms reject an explicit version but accept "install latest".
                 # Poll before reporting; do not mark a persistent 5xx as success just because preflight passed.
-                attempt_exception = {'type': type(exc).__name__, 'message': str(exc)[:300]}
+                attempt_exception = {'type': type(exc).__name__, 'message': safe_exception_message(exc)}
                 post_exception = attempt_exception
                 install_attempts.append({'attempt': service_attempt, 'variant': variant_index, 'service_payload': attempt_payload, 'error_type': attempt_exception['type'], 'error': attempt_exception['message']})
             op.state = 'Validating'; db.flush()
@@ -509,6 +517,10 @@ def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: 
                 stop_attempts = True
                 break
         if stop_attempts:
+            break
+        # A POST exception is ambiguous.  We already reconciled HA state via
+        # the poll above; do not submit this non-idempotent action again.
+        if post_exception:
             break
         if service_attempt < 3:
             op.state = f'Retrying install after Home Assistant error ({service_attempt}/3)'; db.flush()
@@ -539,15 +551,15 @@ def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: 
             update.raw_json = json.dumps(after or {}, default=str)[:20000]
         else:
             op.state = 'Load failed — Home Assistant rejected update install'
-            op.status = 'manual_intervention_required'
+            op.status = 'outcome_unknown'
             create_notification(db, severity='critical', title=f'Home Assistant update failed: {inst.friendly_name} / {update.component}', body=f'Install service failed for {update.entity_id}; version stayed at {attrs.get("installed_version") or "unknown"}. Check the instance directly.', instance_id=inst.id, update_id=update.id)
     else:
         op.state = 'Manual Intervention Required'
         op.status = 'manual_intervention_required'
         create_notification(db, severity='critical', title=f'Home Assistant update needs manual validation: {inst.friendly_name} / {update.component}', body=f'Install service returned but update still appears pending for {update.entity_id}.', instance_id=inst.id, update_id=update.id)
     op.ended_at = now()
-    op.details_json = json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': payload.get('version'), 'backup_requested': bool(payload.get('backup')), 'service_payload': payload, 'service_response': response, 'post_exception': post_exception, 'install_attempts': install_attempts, 'restart_repairs': restart_repairs if 'restart_repairs' in locals() else [], 'before': {'state': before.get('state'), 'installed_version': attrs.get('installed_version'), 'latest_version': attrs.get('latest_version'), 'in_progress': attrs.get('in_progress'), 'update_percentage': attrs.get('update_percentage')}, 'after': {'state': after.get('state'), 'installed_version': after_attrs.get('installed_version'), 'latest_version': after_attrs.get('latest_version'), 'in_progress': after_attrs.get('in_progress'), 'update_percentage': after_attrs.get('update_percentage')}, 'validation_observations': observations[-12:]})
-    append_vault_update_log(
+    op.details_json = json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': update.available_version, 'backup_requested': bool(payload.get('backup')), 'service_payload': payload, 'service_response': response, 'post_exception': post_exception, 'install_attempts': install_attempts, 'restart_repairs': restart_repairs if 'restart_repairs' in locals() else [], 'before': {'state': before.get('state'), 'installed_version': attrs.get('installed_version'), 'latest_version': attrs.get('latest_version'), 'in_progress': attrs.get('in_progress'), 'update_percentage': attrs.get('update_percentage')}, 'after': {'state': after.get('state'), 'installed_version': after_attrs.get('installed_version'), 'latest_version': after_attrs.get('latest_version'), 'in_progress': after_attrs.get('in_progress'), 'update_percentage': after_attrs.get('update_percentage')}, 'validation_observations': observations[-12:]})
+    safe_append_diagnostic(lambda: append_vault_update_log(
         f'{ct_now()} — {inst.friendly_name} — {update.component}',
         [
             f'- Instance: {inst.friendly_name}',
@@ -559,7 +571,7 @@ def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: 
             f'- Release URL: {update.release_url or "not provided"}',
             f'- Operation ID: {op.id}',
         ],
-    )
+    ))
     audit_action = 'update_install_action_required' if op.status == 'action_required' else ('update_install_executed' if op.status != 'accepted' else 'update_install_accepted_unverified')
     audit(db, action=audit_action, resource_type='update_record', resource_id=update.id, instance_id=inst.id, result=op.status, metadata={'operation_id': op.id, 'target_version': update.available_version, 'actor': actor, 'post_exception': post_exception.get('type') if post_exception else None})
     return op
@@ -568,21 +580,35 @@ def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: 
 def skip_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: str = 'user') -> Operation:
     token = CredentialService().get_instance_token(db, inst.id)
     adapter = HomeAssistantAdapter(inst, token)
-    op = Operation(kind='update_skip', instance_id=inst.id, state='Skipping', status='running', started_at=now(), details_json=json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': update.available_version, 'actor': actor}))
-    db.add(op); db.flush()
+    target = update.available_version or 'latest'
+    op = create_operation(db, kind='update_skip', instance=inst,
+                          idempotency_key=f'update_skip:{inst.id}:{update.entity_id}:{target}',
+                          recovery_action='reconcile_skip',
+                          details={'update_id': update.id, 'entity_id': update.entity_id, 'target_version': target, 'actor': actor})
+    if op.status in {'succeeded', 'accepted', 'verification_pending', 'outcome_unknown'}:
+        return op
+    op.state = 'Skipping'; op.status = 'running'; op.started_at = now(); op.attempt_count = (op.attempt_count or 0) + 1
+    db.flush()
     payload = {'entity_id': update.entity_id}
     # HA's update.skip skips the current latest version for the entity; passing version is not universally supported.
     try:
         response = adapter.post('/api/services/update/skip', payload)
+        state = adapter.get(f'/api/states/{update.entity_id}')
+        attrs = state.get('attributes') or {}
+        verified = attrs.get('skipped_version') == update.available_version or state.get('state') in {'off', 'skipped'}
+        if not verified:
+            op.state = 'Verification pending'; op.status = 'verification_pending'; op.ended_at = now()
+            op.details_json = json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': update.available_version, 'service_payload': payload, 'service_response': response, 'verification': 'not_observable'})
+            return op
         update.skip_state = 'skipped'
         update.installation_state = 'skipped'
         op.state = 'Skipped'; op.status = 'succeeded'; op.ended_at = now()
         op.details_json = json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': update.available_version, 'service_payload': payload, 'service_response': response})
         audit(db, action='update_skipped', resource_type='update_record', resource_id=update.id, instance_id=inst.id, result='success', metadata={'operation_id': op.id, 'actor': actor})
     except Exception as exc:
-        op.state = 'Skip Failed'; op.status = 'failed'; op.ended_at = now()
-        op.details_json = json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': update.available_version, 'service_payload': payload, 'error': {'type': type(exc).__name__, 'message': str(exc)[:300]}})
-        create_notification(db, severity='warning', title=f'Home Assistant skip failed: {inst.friendly_name} / {update.component}', body=f'{type(exc).__name__}: {str(exc)[:300]}', instance_id=inst.id, update_id=update.id)
+        op.state = 'Skip outcome unknown'; op.status = 'outcome_unknown'; op.ended_at = now()
+        op.details_json = json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': update.available_version, 'service_payload': payload, 'error': {'type': type(exc).__name__, 'message': safe_exception_message(exc)}})
+        create_notification(db, severity='warning', title=f'Home Assistant skip failed: {inst.friendly_name} / {update.component}', body=safe_exception_message(exc), instance_id=inst.id, update_id=update.id)
         audit(db, action='update_skip_failed', resource_type='update_record', resource_id=update.id, instance_id=inst.id, result='failed', metadata={'operation_id': op.id, 'error': type(exc).__name__})
     return op
 
@@ -608,7 +634,7 @@ def monitor_and_act(db: Session, *, auto_execute: bool = True, actor: str = 'aut
                 summary['sync_ok'] += 1
             except Exception as exc:
                 summary['sync_failed'] += 1
-                sync_failure_lines.append(f'- {inst.friendly_name}: {type(exc).__name__}: {str(exc)[:180]}')
+                sync_failure_lines.append(f'- {inst.friendly_name}: {safe_exception_message(exc)}')
                 continue
             updates = [
                 update
@@ -654,11 +680,11 @@ def monitor_and_act(db: Session, *, auto_execute: bool = True, actor: str = 'aut
                 summary['manual_notifications'] += 1
         else:
             resolve_consolidated_notification(db, title=summary_title)
-        job.status = 'succeeded'; job.ended_at = now(); job.details_json = json.dumps(summary, default=str)
-        audit(db, action='monitor_and_act_completed', resource_type='job_run', resource_id=job.id, result='success', metadata=summary)
+        job.status = 'partial_failed' if summary['sync_failed'] else 'succeeded'; job.ended_at = now(); job.details_json = json.dumps(summary, default=str)
+        audit(db, action='monitor_and_act_completed', resource_type='job_run', resource_id=job.id, result=job.status, metadata=summary)
         return summary | {'job_id': job.id}
     except Exception as exc:
-        job.status = 'failed'; job.ended_at = now(); job.details_json = json.dumps({'error': type(exc).__name__, 'message': str(exc)[:500], 'summary': summary}, default=str)
+        job.status = 'failed'; job.ended_at = now(); job.details_json = json.dumps({'error': type(exc).__name__, 'message': safe_exception_message(exc), 'summary': summary}, default=str)
         audit(db, action='monitor_and_act_failed', resource_type='job_run', resource_id=job.id, result='failed', metadata={'error': type(exc).__name__})
         raise
 
@@ -666,9 +692,16 @@ def monitor_and_act(db: Session, *, auto_execute: bool = True, actor: str = 'aut
 def create_instance_backup(db: Session, inst: Instance, *, actor: str = 'user') -> BackupRecord:
     token = CredentialService().get_instance_token(db, inst.id)
     adapter = HomeAssistantAdapter(inst, token)
+    op = create_operation(db, kind='backup_create', instance=inst,
+                          idempotency_key=f'backup_create:{inst.id}',
+                          recovery_action='verify_backup', details={'actor': actor})
+    existing = db.query(BackupRecord).filter(BackupRecord.details_json.like(f'%"operation_id": {op.id}%')).order_by(BackupRecord.id.desc()).first()
+    if existing and op.status in {'succeeded', 'verification_pending', 'outcome_unknown'}:
+        return existing
     rec = BackupRecord(instance_id=inst.id, provider='home_assistant', status='running', started_at=now(), name=f'Fleet Manager backup {ct_now()}')
     db.add(rec); db.flush()
-    details = {'actor': actor, 'attempts': []}
+    details = {'actor': actor, 'operation_id': op.id, 'request_id': op.request_id,
+               'backup_record_id': rec.id, 'name': rec.name, 'attempts': []}
     try:
         response = None
         backup_attempts = [
@@ -684,20 +717,39 @@ def create_instance_backup(db: Session, inst: Instance, *, actor: str = 'user') 
                 break
             except Exception as exc:
                 last_error = exc
-                details['attempts'].append({'endpoint': endpoint, 'ok': False, 'error': type(exc).__name__, 'message': str(exc)[:240]})
+                details['attempts'].append({'endpoint': endpoint, 'ok': False, 'error': type(exc).__name__, 'message': safe_exception_message(exc)})
+                message = str(exc).lower()
+                definitively_unsupported = any(marker in message for marker in ('404', '405', 'not found', 'unknown service', 'service not found'))
+                if not definitively_unsupported:
+                    # A timeout, disconnect, or 5xx may mean HA accepted the
+                    # request. Never submit a second backup in that ambiguity.
+                    raise
         else:
             assert last_error is not None
             raise last_error
-        rec.status = 'completed'; rec.completed_at = now()
         rec.backup_id = str((response or {}).get('slug') or (response or {}).get('backup_id') or '') or None
-        inst.last_successful_backup = rec.completed_at; inst.backup_compliance_state = 'current'
+        # A service response is not proof that HA persisted the backup.  A stable
+        # returned identifier is the only response-only evidence we accept.
+        verified = bool(rec.backup_id)
+        rec.status = 'completed' if verified else 'verification_pending'
+        rec.completed_at = now()
+        op.status = 'succeeded' if verified else 'verification_pending'
+        op.state = op.status
+        op.ended_at = rec.completed_at
+        if verified:
+            inst.last_successful_backup = rec.completed_at
+            inst.backup_compliance_state = 'current'
+        details['backup_id'] = rec.backup_id
         details['response_summary'] = {k: v for k, v in (response or {}).items() if k in {'slug','backup_id','name','date'}} if isinstance(response, dict) else {}
-        append_vault_update_log(f'{ct_now()} — {inst.friendly_name} — backup created', [f'- Instance: {inst.friendly_name}', f'- Backup record ID: {rec.id}', f'- Backup ID: {rec.backup_id or "not returned"}', f'- Actor: {actor}', '- Result: completed'])
-        audit(db, action='backup_created', resource_type='backup_record', resource_id=rec.id, instance_id=inst.id, result='success', metadata={'actor': actor})
+        safe_append_diagnostic(lambda: append_vault_update_log(f'{ct_now()} — {inst.friendly_name} — backup created', [f'- Instance: {inst.friendly_name}', f'- Backup record ID: {rec.id}', f'- Backup ID: {rec.backup_id or "not returned"}', f'- Actor: {actor}', f'- Result: {rec.status}', f'- Operation ID: {op.id}']))
+        audit(db, action='backup_created', resource_type='backup_record', resource_id=rec.id, instance_id=inst.id, request_id=op.request_id, result=op.status, metadata={'actor': actor, 'operation_id': op.id})
     except Exception as exc:
         rec.status = 'unsupported_or_failed'; rec.completed_at = now()
-        details['error'] = {'type': type(exc).__name__, 'message': str(exc)[:300]}
-        create_notification(db, severity='warning', title=f'Home Assistant backup unavailable: {inst.friendly_name}', body=f'{type(exc).__name__}: {str(exc)[:300]}', instance_id=inst.id)
-        audit(db, action='backup_failed', resource_type='backup_record', resource_id=rec.id, instance_id=inst.id, result='failed', metadata={'error': type(exc).__name__})
+        op.status = 'outcome_unknown'; op.state = 'outcome_unknown'; op.ended_at = rec.completed_at
+        op.error_code = type(exc).__name__; op.error_message = safe_exception_message(exc)
+        details['error'] = {'type': type(exc).__name__, 'message': safe_exception_message(exc)}
+        create_notification(db, severity='warning', title=f'Home Assistant backup unavailable: {inst.friendly_name}', body=safe_exception_message(exc), instance_id=inst.id)
+        audit(db, action='backup_failed', resource_type='backup_record', resource_id=rec.id, instance_id=inst.id, request_id=op.request_id, result='failed', metadata={'error': type(exc).__name__, 'operation_id': op.id})
     rec.details_json = json.dumps(details, default=str)
+    op.details_json = json.dumps(details, default=str)
     return rec

@@ -27,6 +27,7 @@ from .services.audit import audit
 from .services.credentials import CredentialService
 from .services.ha_adapter import HomeAssistantAdapter, persist_instance_health, sync_updates, validate_instance_url
 from .services.automation import create_instance_backup, install_update, load_auto_policy, monitor_and_act, review_update_for_auto, skip_update, update_matches_stack
+from .services.reliability import create_operation, migrate_operation_columns, public_error_message, reconcile_operation, reconcile_startup, safe_append_diagnostic, safe_exception_message, _safe
 
 app = FastAPI(title='Home Assistant Fleet Manager', version='0.1.0')
 app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -118,6 +119,7 @@ class TestNotificationIn(NotificationSettingsIn):
     channel: str
 
 def ensure_app_defaults(db: Session):
+    migrate_operation_columns(engine)
     if engine.url.get_backend_name() == 'sqlite':
         existing = {row[1] for row in db.execute(text('PRAGMA table_info(users)')).all()}
         if 'username' not in existing:
@@ -171,9 +173,9 @@ def run_update_discovery(db: Session, *, actor: str = 'scheduler') -> dict:
                 summary['results'].append({'instance_id': inst.id, 'ok': True, 'pending': pending})
             except Exception as exc:
                 summary['sync_failed'] += 1
-                summary['results'].append({'instance_id': inst.id, 'ok': False, 'error': str(exc)[:160]})
-        job.status='succeeded'; job.ended_at=now(); job.details_json=json.dumps(summary)
-        audit(db, action='scheduled_update_check_completed', resource_type='job_run', resource_id=job.id, result='success', metadata=summary)
+                summary['results'].append({'instance_id': inst.id, 'ok': False, 'error': safe_exception_message(exc)})
+        job.status='partial_failed' if summary['sync_failed'] else 'succeeded'; job.ended_at=now(); job.details_json=json.dumps(summary)
+        audit(db, action='scheduled_update_check_completed', resource_type='job_run', resource_id=job.id, result=job.status, metadata=summary)
         return summary
     except Exception as exc:
         job.status='failed'; job.ended_at=now(); job.details_json=json.dumps({'error': type(exc).__name__, **summary})
@@ -184,6 +186,16 @@ async def schedule_loop():
     await asyncio.sleep(10)
     while True:
         try:
+            # Reconcile durable operations continuously, not only after a
+            # process restart. This is read-only against Home Assistant.
+            with SessionLocal() as reconcile_db:
+                def reconcile_adapter_factory(instance_id):
+                    instance = reconcile_db.get(Instance, instance_id)
+                    if not instance:
+                        raise LookupError('instance not found')
+                    token = CredentialService().get_instance_token(reconcile_db, instance_id)
+                    return HomeAssistantAdapter(instance, token)
+                reconcile_startup(reconcile_db, adapter_factory=reconcile_adapter_factory)
             with SessionLocal() as db:
                 sched = db.query(Schedule).filter(Schedule.enabled == True, Schedule.kind.in_(['update_discovery','monitor_and_act'])).order_by(Schedule.id).first()
                 if sched:
@@ -199,8 +211,18 @@ async def schedule_loop():
                             summary = run_update_discovery(db, actor='scheduler')
                         sched.last_run_at = now()
                         db.commit()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Never silently lose scheduler failures: persist a diagnostic run.
+            try:
+                with SessionLocal() as error_db:
+                    failed = JobRun(kind='scheduler_loop', status='failed', started_at=now(), ended_at=now(),
+                                    details_json=json.dumps({'error': type(exc).__name__, 'message': safe_exception_message(exc)}))
+                    error_db.add(failed); error_db.flush()
+                    audit(error_db, action='scheduler_loop_failed', resource_type='job_run', resource_id=failed.id,
+                          result='failed', metadata={'error': type(exc).__name__})
+                    error_db.commit()
+            except Exception:
+                pass
         await asyncio.sleep(60)
 
 def startup_init():
@@ -208,6 +230,13 @@ def startup_init():
     with SessionLocal() as db:
         ensure_app_defaults(db)
         ensure_admin(db)
+        def adapter_factory(instance_id):
+            instance = db.get(Instance, instance_id)
+            if not instance:
+                raise LookupError('instance not found')
+            token = CredentialService().get_instance_token(db, instance_id)
+            return HomeAssistantAdapter(instance, token)
+        reconcile_startup(db, adapter_factory=adapter_factory)
 startup_init()
 
 @app.on_event('startup')
@@ -558,7 +587,7 @@ def test_notification_settings(data: TestNotificationIn, s=Depends(csrf), db: Se
     except httpx.HTTPError as exc:
         raise HTTPException(502, f'Test notification failed: {type(exc).__name__}')
     except smtplib.SMTPException as exc:
-        raise HTTPException(502, f'Test email failed: {type(exc).__name__}: {str(exc)[:160]}')
+        raise HTTPException(502, f'Test email failed: {type(exc).__name__}')
     audit(db, action='test_notification_sent', resource_type='application_settings', actor_user_id=s.user_id, metadata={'channel': data.channel})
     db.commit(); return result
 
@@ -598,11 +627,10 @@ def oidc_callback(request: Request, code: str | None = None, state: str | None =
             user_resp.raise_for_status()
             profile = user_resp.json()
         except httpx.HTTPStatusError as exc:
-            body = exc.response.text[:500]
-            audit(db, action='oidc_login_failed', resource_type='auth', result='failed', metadata={'issuer': value.get('issuer_url'), 'status_code': exc.response.status_code, 'redirect_uri': redirect_uri, 'provider_error': body[:220]})
+            audit(db, action='oidc_login_failed', resource_type='auth', result='failed', metadata={'issuer': value.get('issuer_url'), 'status_code': exc.response.status_code, 'redirect_uri': redirect_uri, 'provider_error': f'Provider returned HTTP {exc.response.status_code}'})
             db.commit()
             hint = 'OIDC token exchange failed. Check Authentik redirect URI/client settings.' if str(exc.request.url) == meta.get('token_endpoint') else 'OIDC profile lookup failed.'
-            return oidc_error_page(f'{hint} Provider returned HTTP {exc.response.status_code}: {body}')
+            return oidc_error_page(f'{hint} Provider returned HTTP {exc.response.status_code}.')
         except (httpx.HTTPError, ValueError) as exc:
             audit(db, action='oidc_login_failed', resource_type='auth', result='failed', metadata={'issuer': value.get('issuer_url'), 'error': type(exc).__name__, 'redirect_uri': redirect_uri})
             db.commit()
@@ -702,22 +730,34 @@ def sync_instance(instance_id:int, s=Depends(csrf), db: Session = Depends(get_db
     try:
         persist_instance_health(db, inst, token); count=sync_updates(db, inst, token); audit(db, action='update_discovered', resource_type='instance', actor_user_id=s.user_id, resource_id=inst.id, instance_id=inst.id, metadata={'pending': count}); db.commit(); return {'ok': True, 'pending': count}
     except Exception as exc:
-        audit(db, action='instance_sync_failed', resource_type='instance', actor_user_id=s.user_id, resource_id=inst.id, instance_id=inst.id, result='failed', metadata={'error': type(exc).__name__}); db.commit(); raise HTTPException(502, str(exc))
+        audit(db, action='instance_sync_failed', resource_type='instance', actor_user_id=s.user_id, resource_id=inst.id, instance_id=inst.id, result='failed', metadata={'error': type(exc).__name__}); db.commit(); raise HTTPException(502, safe_exception_message(exc))
 
 @app.post('/api/instances/{instance_id}/restart')
 def restart_instance(instance_id:int, s=Depends(csrf), db: Session = Depends(get_db)):
     require_permission(s,'execute_updates')
     inst=db.get(Instance, instance_id)
     if not inst: raise HTTPException(404,'Instance not found')
+    request_id = secrets.token_urlsafe(12)
+    try:
+        op = create_operation(db, kind='restart', instance=inst, request_id=request_id,
+                              idempotency_key=f'restart:{inst.id}', recovery_action='retry_restart',
+                              details={'instance_id': inst.id, 'actor': s.user.email})
+    except ValueError:
+        raise HTTPException(409, 'Another incompatible operation is already active for this instance')
+    if op.status == 'succeeded':
+        return {'ok': True, 'message': 'Restart already verified', 'state': op.state, 'operation_id': op.id,
+                'status': op.status, 'recovery': op.recovery_action}
     token=CredentialService().get_instance_token(db, inst.id)
     try:
         HomeAssistantAdapter(inst, token).post('/api/services/homeassistant/restart', {})
+        op.status='restarting'; op.state='restarting'; op.started_at=now(); op.attempt_count=(op.attempt_count or 0)+1
         inst.connectivity_state='restarting'; inst.health_state='restarting'; inst.last_failed_connection=now()
-        audit(db, action='instance_restart_requested', resource_type='instance', actor_user_id=s.user_id, resource_id=inst.id, instance_id=inst.id, metadata={'name': inst.friendly_name, 'state': 'restarting'})
-        db.commit(); return {'ok': True, 'message': 'Restart requested', 'state': 'restarting'}
+        audit(db, action='instance_restart_requested', resource_type='instance', actor_user_id=s.user_id, resource_id=inst.id, instance_id=inst.id, request_id=op.request_id, metadata={'name': inst.friendly_name, 'state': 'restarting', 'operation_id': op.id})
+        db.commit(); return {'ok': True, 'message': 'Restart requested', 'state': 'restarting', 'status': op.status, 'operation_id': op.id, 'recovery': op.recovery_action}
     except Exception as exc:
-        audit(db, action='instance_restart_failed', resource_type='instance', actor_user_id=s.user_id, resource_id=inst.id, instance_id=inst.id, result='failed', metadata={'error': type(exc).__name__})
-        db.commit(); raise HTTPException(502, str(exc))
+        op.status='outcome_unknown'; op.state='outcome_unknown'; op.error_code=type(exc).__name__; op.error_message=safe_exception_message(exc); op.ended_at=now()
+        audit(db, action='instance_restart_failed', resource_type='instance', actor_user_id=s.user_id, resource_id=inst.id, instance_id=inst.id, request_id=op.request_id, result='failed', metadata={'error': type(exc).__name__, 'operation_id': op.id})
+        db.commit(); raise HTTPException(502, f'Restart request failed ({type(exc).__name__})')
 
 @app.post('/api/sync-all')
 def sync_all(s=Depends(csrf), db: Session = Depends(get_db)):
@@ -781,7 +821,7 @@ def repairs(s=Depends(current_session), db: Session = Depends(get_db)):
                 if not r['ignored']:
                     rows.append(r)
         except Exception as exc:
-            rows.append({'instance_id': inst.id, 'instance': inst.friendly_name, 'domain': 'fleet_manager', 'issue_id': 'repairs_unavailable', 'title': 'Repairs unavailable', 'severity': 'error', 'is_fixable': False, 'ignored': False, 'created': None, 'learn_more_url': None, 'details': str(exc)[:180]})
+            rows.append({'instance_id': inst.id, 'instance': inst.friendly_name, 'domain': 'fleet_manager', 'issue_id': 'repairs_unavailable', 'title': 'Repairs unavailable', 'severity': 'error', 'is_fixable': False, 'ignored': False, 'created': None, 'learn_more_url': None, 'details': safe_exception_message(exc)})
     return rows
 
 
@@ -792,10 +832,23 @@ def fix_repair(data: RepairFixIn, s=Depends(csrf), db: Session = Depends(get_db)
     if not inst: raise HTTPException(404,'Instance not found')
     if not data.domain.strip() or not data.issue_id.strip():
         raise HTTPException(422,'Repair domain and issue ID are required')
+    requested_action = (data.action or '').strip()
+    if requested_action not in {'host_reboot', 'ha_restart'}:
+        raise HTTPException(422, 'No Fleet Manager action for this repair')
     token=CredentialService().get_instance_token(db, inst.id)
+    op = None
     try:
-        requested_action = (data.action or '').strip()
         adapter = HomeAssistantAdapter(inst, token)
+        kind = 'repair_reboot' if requested_action == 'host_reboot' else 'repair_restart'
+        try:
+            op = create_operation(db, kind=kind, instance=inst,
+                                  idempotency_key=f'{kind}:{inst.id}:{data.issue_id}',
+                                  recovery_action='retry_restart',
+                                  details={'issue_id': data.issue_id, 'domain': data.domain, 'actor': s.user.email})
+        except ValueError:
+            raise HTTPException(409, 'Another incompatible operation is already active for this instance')
+        if op.status == 'succeeded':
+            return {'ok': True, 'message': 'Repair action already verified', 'operation_id': op.id, 'status': op.status, 'recovery': op.recovery_action}
         reboot_result = {}
         if requested_action == 'host_reboot':
             adapter.trigger_shutdown_automations('host_reboot')
@@ -808,13 +861,16 @@ def fix_repair(data: RepairFixIn, s=Depends(csrf), db: Session = Depends(get_db)
             inst.connectivity_state='restarting'; inst.health_state='restarting'; inst.last_failed_connection=now()
         else:
             raise HTTPException(422, 'No Fleet Manager action for this repair')
-        audit(db, action='repair_fix_requested', resource_type='repair', actor_user_id=s.user_id, resource_id=data.issue_id, instance_id=inst.id, metadata={'domain': data.domain, 'issue_id': data.issue_id, 'action': requested_action, 'state': inst.connectivity_state, 'reboot_endpoint': reboot_result.get('endpoint'), 'attempts': reboot_result.get('attempts')})
-        db.commit(); return {'ok': True, 'message': 'Repair action started'}
+        op.status='restarting'; op.state='restarting'; op.started_at=now(); op.attempt_count=(op.attempt_count or 0)+1
+        audit(db, action='repair_fix_requested', resource_type='repair', actor_user_id=s.user_id, resource_id=data.issue_id, instance_id=inst.id, request_id=op.request_id, metadata={'domain': data.domain, 'issue_id': data.issue_id, 'action': requested_action, 'state': inst.connectivity_state, 'reboot_endpoint': reboot_result.get('endpoint'), 'attempts': reboot_result.get('attempts'), 'operation_id': op.id})
+        db.commit(); return {'ok': True, 'message': 'Repair action started', 'operation_id': op.id, 'status': op.status, 'recovery': op.recovery_action}
     except HTTPException:
         raise
     except Exception as exc:
-        audit(db, action='repair_fix_failed', resource_type='repair', actor_user_id=s.user_id, resource_id=data.issue_id, instance_id=inst.id, result='failed', metadata={'domain': data.domain, 'issue_id': data.issue_id, 'error': type(exc).__name__})
-        db.commit(); raise HTTPException(502, str(exc))
+        if op is not None:
+            op.status='outcome_unknown'; op.state='outcome_unknown'; op.error_code=type(exc).__name__; op.error_message=safe_exception_message(exc); op.ended_at=now()
+        audit(db, action='repair_fix_failed', resource_type='repair', actor_user_id=s.user_id, resource_id=data.issue_id, instance_id=inst.id, result='failed', metadata={'domain': data.domain, 'issue_id': data.issue_id, 'error': type(exc).__name__, 'operation_id': op.id if op is not None else None})
+        db.commit(); raise HTTPException(502, f'Repair action failed ({type(exc).__name__})')
 
 def refresh_pending_update_snapshot(db: Session, update: UpdateRecord, inst: Instance | None):
     """Refresh one pending update entity so progress/version shown in the UI is not stale DB data."""
@@ -865,10 +921,10 @@ def create_deployment(data: DeploymentPlanIn, s=Depends(csrf), db: Session = Dep
     return {'id':plan.id,'name':plan.name,'status':plan.status,'summary':summary}
 @app.get('/api/deployments')
 def deployment_list(s=Depends(current_session), db: Session = Depends(get_db)):
-    require_permission(s,'create_deployment_plans'); return [{'id':p.id,'name':p.name,'status':p.status,'created_at':p.created_at.isoformat(),'summary':json.loads(p.summary_json)} for p in db.query(DeploymentPlan).order_by(DeploymentPlan.id.desc()).all()]
+    require_permission(s,'create_deployment_plans'); return [{'id':p.id,'name':p.name,'status':p.status,'created_at':p.created_at.isoformat(),'summary':_safe(json.loads(p.summary_json))} for p in db.query(DeploymentPlan).order_by(DeploymentPlan.id.desc()).all()]
 @app.get('/api/audit')
 def audit_log(s=Depends(current_session), db: Session = Depends(get_db)):
-    require_permission(s,'view_audit_history'); return [{'timestamp':a.timestamp.isoformat(),'actor_user_id':a.actor_user_id,'action':a.action,'resource_type':a.resource_type,'resource_id':a.resource_id,'instance_id':a.instance_id,'result':a.result,'metadata':json.loads(a.metadata_json or '{}')} for a in db.query(AuditEvent).order_by(AuditEvent.id.desc()).limit(200).all()]
+    require_permission(s,'view_audit_history'); return [{'timestamp':a.timestamp.isoformat(),'actor_user_id':a.actor_user_id,'action':a.action,'resource_type':a.resource_type,'resource_id':a.resource_id,'instance_id':a.instance_id,'result':a.result,'metadata':_safe(json.loads(a.metadata_json or '{}'))} for a in db.query(AuditEvent).order_by(AuditEvent.id.desc()).limit(200).all()]
 
 @app.get('/api/approvals')
 def approvals(s=Depends(current_session), db: Session = Depends(get_db)):
@@ -944,56 +1000,58 @@ def install_single_update(update_id:int, s=Depends(csrf), db: Session = Depends(
     if upd.installation_state != 'available':
         raise HTTPException(422,'Update is not pending')
     op=install_update(db, inst, upd, actor=f'user:{s.user.email}')
-    db.commit(); return {'ok': op.status in {'succeeded','accepted','action_required'}, 'status': op.status, 'state': op.state, 'operation_id': op.id, 'update': serialize_update(upd), 'details': json.loads(op.details_json or '{}')}
+    db.commit(); return {'ok': op.status in {'succeeded','accepted','action_required'}, 'status': op.status, 'state': op.state, 'operation_id': op.id, 'update': serialize_update(upd), 'details': _safe(json.loads(op.details_json or '{}'))}
 
 @app.post('/api/updates/bulk')
 def bulk_updates(data: BulkUpdateIn, s=Depends(csrf), db: Session = Depends(get_db)):
-    if not data.update_ids:
+    unique_ids = list(dict.fromkeys(int(x) for x in data.update_ids))
+    if not unique_ids:
         raise HTTPException(422, 'Select at least one update')
     action = data.action.lower().strip()
-    updates = db.query(UpdateRecord).filter(UpdateRecord.id.in_(data.update_ids)).all()
+    if action not in {'update', 'skip', 'review'}:
+        raise HTTPException(422, 'Action must be update, skip, or review')
+    require_permission(s, 'execute_updates' if action == 'update' else 'view_updates')
+    found = {u.id: u for u in db.query(UpdateRecord).filter(UpdateRecord.id.in_(unique_ids)).all()}
+    updates = [found[i] for i in unique_ids if i in found]
     instances = {i.id: i for i in db.query(Instance).filter(Instance.id.in_({u.instance_id for u in updates})).all()}
     policy = load_auto_policy(db)
-    summary = {'action': action, 'selected': len(data.update_ids), 'found': len(updates), 'updated': 0, 'action_required': 0, 'skipped': 0, 'reviewed': 0, 'blocked': [], 'failed': []}
-    if action == 'skip':
-        require_permission(s, 'view_updates')
-        for upd in updates:
-            inst = instances.get(upd.instance_id)
+    batch_id = secrets.token_urlsafe(18)
+    job = JobRun(kind='bulk_update', status='running', started_at=now(), details_json='{}')
+    db.add(job); db.flush()
+    summary = {'action': action, 'batch_id': batch_id, 'job_id': job.id, 'selected': len(unique_ids), 'found': len(updates), 'updated': 0, 'action_required': 0, 'skipped': 0, 'reviewed': 0, 'blocked': [], 'failed': [], 'results': []}
+    for missing_id in [i for i in unique_ids if i not in found]:
+        item = {'update': missing_id, 'instance': None, 'operation': None, 'status': 'failed', 'reason': 'update_not_found'}
+        summary['failed'].append(item); summary['results'].append(item)
+    for upd in updates:
+        inst = instances.get(upd.instance_id)
+        item = {'update': upd.id, 'instance': inst.id if inst else None, 'operation': None, 'status': 'failed', 'reason': None}
+        try:
             if not inst:
-                summary['failed'].append({'id': upd.id, 'component': upd.component, 'reason': 'instance_not_found'}); continue
-            if upd.installation_state != 'available':
-                summary['blocked'].append({'id': upd.id, 'instance': inst.friendly_name, 'component': upd.component, 'reason': 'not_pending'}); continue
-            op = skip_update(db, inst, upd, actor=f'user:{s.user.email}')
-            if op.status == 'succeeded':
-                summary['skipped'] += 1
+                raise LookupError('instance_not_found')
+            if action in {'update', 'skip'} and (upd.installation_state != 'available' or (action == 'update' and upd.skip_state == 'skipped')):
+                item.update(status='blocked', reason='not_pending'); summary['blocked'].append(dict(item)); summary['results'].append(item); continue
+            if action == 'review':
+                ok, reasons, _notes = review_update_for_auto(upd, policy)
+                summary['reviewed'] += 1
+                item.update(status='reviewed' if ok else 'blocked', reason=None if ok else ','.join(reasons[:5]))
+                if not ok: summary['blocked'].append(dict(item))
+                audit(db, action='update_reviewed', resource_type='update_record', actor_user_id=s.user_id, resource_id=upd.id, instance_id=upd.instance_id, metadata={'eligible': ok, 'reasons': reasons, 'batch_id': batch_id})
             else:
-                summary['failed'].append({'id': upd.id, 'instance': inst.friendly_name, 'component': upd.component, 'reason': op.state})
-    elif action == 'review':
-        require_permission(s, 'view_updates')
-        for upd in updates:
-            ok, reasons, _notes = review_update_for_auto(upd, policy)
-            summary['reviewed'] += 1
-            if not ok:
-                inst = instances.get(upd.instance_id)
-                summary['blocked'].append({'id': upd.id, 'instance': inst.friendly_name if inst else None, 'component': upd.component, 'reason': ','.join(reasons[:5])})
-            audit(db, action='update_reviewed', resource_type='update_record', actor_user_id=s.user_id, resource_id=upd.id, instance_id=upd.instance_id, metadata={'eligible': ok, 'reasons': reasons})
-    elif action == 'update':
-        require_permission(s, 'execute_updates')
-        for upd in updates:
-            inst = instances.get(upd.instance_id)
-            if not inst:
-                summary['failed'].append({'id': upd.id, 'component': upd.component, 'reason': 'instance_not_found'}); continue
-            if upd.installation_state != 'available' or upd.skip_state == 'skipped':
-                summary['blocked'].append({'id': upd.id, 'instance': inst.friendly_name, 'component': upd.component, 'reason': 'not_pending'}); continue
-            op = install_update(db, inst, upd, actor=f'user:{s.user.email}')
-            if op.status == 'action_required':
-                summary['action_required'] += 1
-            elif op.status in {'succeeded','accepted'}:
-                summary['updated'] += 1
-            else:
-                summary['blocked'].append({'id': upd.id, 'instance': inst.friendly_name, 'component': upd.component, 'reason': op.state})
-    else:
-        raise HTTPException(422, 'Action must be update, skip, or review')
+                op = install_update(db, inst, upd, actor=f'user:{s.user.email}') if action == 'update' else skip_update(db, inst, upd, actor=f'user:{s.user.email}')
+                op.batch_id = op.batch_id or batch_id
+                item.update(operation=op.id, status=op.status, reason=None if op.status == 'succeeded' else op.state)
+                if op.status == 'succeeded':
+                    if action == 'update': summary['updated'] += 1
+                    else: summary['skipped'] += 1
+                elif op.status == 'action_required': summary['action_required'] += 1
+                else: summary['blocked'].append(dict(item))
+            summary['results'].append(item)
+        except Exception as exc:
+            item.update(status='failed', reason=safe_exception_message(exc))
+            summary['failed'].append(dict(item)); summary['results'].append(item)
+    job.status = 'partial_failed' if summary['failed'] or summary['blocked'] else 'succeeded'
+    job.ended_at = now(); job.details_json = json.dumps(summary, default=str)
+    audit(db, action='bulk_update_completed', resource_type='job_run', actor_user_id=s.user_id, resource_id=job.id, result=job.status, metadata={'batch_id': batch_id, 'selected': len(unique_ids), 'failed': len(summary['failed']), 'blocked': len(summary['blocked'])})
     db.commit(); return summary
 
 @app.get('/api/notifications')
@@ -1004,17 +1062,71 @@ def notifications(s=Depends(current_session), db: Session = Depends(get_db)):
 @app.get('/api/operations')
 def operations(s=Depends(current_session), db: Session = Depends(get_db)):
     require_permission(s,'view_audit_history')
-    return [{'id':o.id,'kind':o.kind,'instance_id':o.instance_id,'deployment_plan_id':o.deployment_plan_id,'state':o.state,'status':o.status,'started_at':o.started_at.isoformat() if o.started_at else None,'ended_at':o.ended_at.isoformat() if o.ended_at else None,'details':json.loads(o.details_json or '{}')} for o in db.query(Operation).order_by(Operation.id.desc()).limit(200).all()]
+    rows=[]
+    for o in db.query(Operation).order_by(Operation.id.desc()).limit(200).all():
+        rows.append({'id':o.id,'kind':o.kind,'instance_id':o.instance_id,'deployment_plan_id':o.deployment_plan_id,
+                     'state':o.state,'status':o.status,'started_at':o.started_at.isoformat() if o.started_at else None,
+                     'ended_at':o.ended_at.isoformat() if o.ended_at else None,'correlation_id':o.correlation_id,
+                     'request_id':o.request_id,'batch_id':o.batch_id,'deadline_at':o.deadline_at.isoformat() if o.deadline_at else None,
+                     'error_code':o.error_code,'error_message':public_error_message(o.error_code) if o.error_code else None,'recovery':o.recovery_action,
+                     'attempt_count':o.attempt_count,'max_attempts':o.max_attempts,
+                     'details':_safe(json.loads(o.details_json or '{}'))})
+    return rows
+
+@app.post('/api/operations/{operation_id}/retry')
+def retry_operation(operation_id:int, s=Depends(csrf), db: Session = Depends(get_db)):
+    require_permission(s, 'execute_updates')
+    op = db.get(Operation, operation_id)
+    if not op:
+        raise HTTPException(404, 'Operation not found')
+    if op.status not in {'failed', 'outcome_unknown', 'verification_pending', 'accepted'}:
+        raise HTTPException(409, f'Operation is not retryable while {op.status}')
+    inst = db.get(Instance, op.instance_id) if op.instance_id else None
+    if not inst:
+        raise HTTPException(422, 'Operation has no instance')
+    token = CredentialService().get_instance_token(db, inst.id)
+    adapter = HomeAssistantAdapter(inst, token)
+    # Always reconcile first. A retry must never duplicate a completed or in-flight HA action.
+    reconcile_operation(db, op, adapter=adapter)
+    if op.status == 'succeeded':
+        db.commit()
+        return {'ok': True, 'status': op.status, 'state': op.state, 'operation_id': op.id, 'recovery': op.recovery_action}
+    if op.kind == 'backup_create':
+        db.commit()
+        raise HTTPException(409, 'Backup outcome is still unverified. Inspect Home Assistant backup history; create a new backup only after confirming no backup was created.')
+    details = json.loads(op.details_json or '{}')
+    entity = details.get('entity_id')
+    if op.kind in {'restart', 'repair_restart', 'repair_reboot'}:
+        raise HTTPException(422, 'Restart/reboot operations cannot be resubmitted; verify Home Assistant and use recovery action: retry_restart')
+    if entity:
+        state = adapter.get(f'/api/states/{entity}')
+        attrs = state.get('attributes') or {}
+        if attrs.get('in_progress') or state.get('state') in {'installing', 'updating'}:
+            op.status='reconnecting'; op.state='reconnecting'; db.commit()
+            return {'ok': True, 'status': op.status, 'state': op.state, 'operation_id': op.id, 'recovery': op.recovery_action}
+    if (op.attempt_count or 0) >= (op.max_attempts or 3):
+        raise HTTPException(409, 'Retry limit reached; manual intervention required')
+    if db.query(Operation).filter(Operation.instance_id == inst.id, Operation.id != op.id,
+                                  Operation.status.in_({'queued','running','accepted','verification_pending','restarting','reconnecting'})).first():
+        raise HTTPException(409, 'Another active operation blocks retry')
+    op.status='queued'; op.state='queued'; op.error_code=None; op.error_message=None
+    update = db.get(UpdateRecord, details.get('update_id'))
+    if not update:
+        raise HTTPException(422, 'Retry target update no longer exists')
+    result = install_update(db, inst, update, actor=f'user:{s.user.email}') if op.kind == 'update_install' else skip_update(db, inst, update, actor=f'user:{s.user.email}')
+    audit(db, action='operation_retried', resource_type='operation', actor_user_id=s.user_id, resource_id=op.id, instance_id=inst.id, metadata={'operation_id': op.id})
+    db.commit()
+    return {'ok': result.status in {'succeeded','accepted','action_required'}, 'status':result.status, 'state':result.state, 'operation_id':result.id, 'recovery':result.recovery_action}
 
 @app.get('/api/jobs')
 def jobs(s=Depends(current_session), db: Session = Depends(get_db)):
     require_permission(s,'view_audit_history')
-    return [{'id':j.id,'kind':j.kind,'status':j.status,'started_at':j.started_at.isoformat(),'ended_at':j.ended_at.isoformat() if j.ended_at else None,'details':json.loads(j.details_json or '{}')} for j in db.query(JobRun).order_by(JobRun.id.desc()).limit(100).all()]
+    return [{'id':j.id,'kind':j.kind,'status':j.status,'started_at':j.started_at.isoformat(),'ended_at':j.ended_at.isoformat() if j.ended_at else None,'details':_safe(json.loads(j.details_json or '{}'))} for j in db.query(JobRun).order_by(JobRun.id.desc()).limit(100).all()]
 
 @app.get('/api/backups')
 def backups(s=Depends(current_session), db: Session = Depends(get_db)):
     require_permission(s,'view_audit_history')
-    return [{'id':b.id,'instance_id':b.instance_id,'provider':b.provider,'status':b.status,'backup_id':b.backup_id,'name':b.name,'started_at':b.started_at.isoformat() if b.started_at else None,'completed_at':b.completed_at.isoformat() if b.completed_at else None,'details':json.loads(b.details_json or '{}')} for b in db.query(BackupRecord).order_by(BackupRecord.id.desc()).limit(100).all()]
+    return [{'id':b.id,'instance_id':b.instance_id,'provider':b.provider,'status':b.status,'backup_id':b.backup_id,'name':b.name,'started_at':b.started_at.isoformat() if b.started_at else None,'completed_at':b.completed_at.isoformat() if b.completed_at else None,'details':_safe(json.loads(b.details_json or '{}'))} for b in db.query(BackupRecord).order_by(BackupRecord.id.desc()).limit(100).all()]
 
 @app.get('/api/schedules')
 def schedules(s=Depends(current_session), db: Session = Depends(get_db)):
@@ -1051,7 +1163,10 @@ def backup_instance(instance_id:int, s=Depends(csrf), db: Session = Depends(get_
     inst=db.get(Instance, instance_id)
     if not inst: raise HTTPException(404,'Instance not found')
     rec=create_instance_backup(db, inst, actor=f'user:{s.user.email}')
-    db.commit(); return {'id':rec.id,'status':rec.status,'backup_id':rec.backup_id,'details':json.loads(rec.details_json or '{}')}
+    details = json.loads(rec.details_json or '{}')
+    operation_id = details.get('operation_id')
+    op = db.get(Operation, operation_id) if operation_id else None
+    db.commit(); return {'id':rec.id,'status':rec.status,'operation_id': operation_id,'backup_id':rec.backup_id,'details':_safe(details)}
 
 @app.patch('/api/schedules/{schedule_id}')
 def update_schedule(schedule_id:int, data: ScheduleIn, s=Depends(csrf), db: Session = Depends(get_db)):

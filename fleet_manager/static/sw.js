@@ -1,5 +1,5 @@
-const CACHE = 'ha-fleet-manager-v20';
-const APP_SHELL = ['/', '/assets/ha-fleet-manager-icon-transparent.png', '/manifest.webmanifest'];
+const CACHE = 'ha-fleet-manager-v23';
+const APP_SHELL = ['/', '/assets/fleet-refresh.js', '/assets/ha-fleet-manager-icon-transparent.png', '/manifest.webmanifest'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(APP_SHELL)).then(() => self.skipWaiting()));
 });

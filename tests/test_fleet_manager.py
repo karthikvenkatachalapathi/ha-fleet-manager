@@ -288,7 +288,8 @@ def test_create_notification_dispatch_failure_is_audited_not_blocking(monkeypatc
     assert n.id is not None
     ev = db.query(AuditEvent).filter_by(action='notification_dispatch_failed', resource_id=str(n.id)).one()
     assert 'pushover' in ev.metadata_json
-    assert 'bad token' in ev.metadata_json
+    assert 'bad token' not in ev.metadata_json
+    assert 'Operation failed (RuntimeError)' in ev.metadata_json
     db.close()
 
 
@@ -333,6 +334,12 @@ def test_oidc_callback_provider_400_returns_friendly_error(monkeypatch):
     assert 'Sign-in failed' in r.text
     assert 'OIDC token exchange failed' in r.text
     assert 'secret' not in r.text
+    assert 'redirect_uri mismatch' not in r.text
+    db = SessionLocal()
+    event = db.query(AuditEvent).filter_by(action='oidc_login_failed').order_by(AuditEvent.id.desc()).first()
+    assert event is not None
+    assert 'redirect_uri mismatch' not in event.metadata_json
+    db.close()
 
 def test_auto_policy_can_disable_or_narrow_automatic_updates():
     db = SessionLocal()
@@ -391,12 +398,13 @@ def test_fleet_manager_ui_has_unrestricted_update_actions_and_oidc_settings():
     assert "bulkAction('update')" in html
     assert "skipOne(${u.id})" in html
     assert "sameVersion(u)" in html
-    assert "function updateIsVisible(u){return u.in_progress||!sameVersion(u)}" in html
-    assert "function updateIsPending(u){return u.in_progress||(u.installation_state==='available'&&u.skip_state!=='skipped')}" in html
+    assert "function updateIsVisible(u){return u.installation_state==='unavailable'||u.in_progress||!sameVersion(u)}" in html
+    assert "function updateIsPending(u){return u.installation_state!=='unavailable'&&(u.in_progress||(u.installation_state==='available'&&u.skip_state!=='skipped'))}" in html
     assert "data.updates.filter(updateIsVisible)" in html
     assert "await refreshInitialFleet()" in html
-    assert "api('/api/sync-all',{method:'POST'})" in html
-    assert html.index("api('/api/sync-all',{method:'POST'})") < html.index("await loadCore()", html.index('async function refreshInitialFleet'))
+    assert "FleetRefresh.createFleetRefreshController" in html
+    assert "await fleetController.manualRefresh()" not in html
+    assert "function syncAll(){" in html
     assert 'Single sign-on' in html
     assert 'Email or username' in html
     assert '/api/auth/oidc/start' in html
@@ -486,6 +494,8 @@ def test_skip_update_calls_ha_skip_without_version(monkeypatch):
         def post(self, path, payload):
             calls.append((path, payload.copy()))
             return {'ok': True}
+        def get(self, path):
+            return {'state': 'off', 'attributes': {'skipped_version': '1.1'}}
 
     import fleet_manager.services.automation as automod
     monkeypatch.setattr(automod, 'CredentialService', FakeCreds)
@@ -559,6 +569,7 @@ def test_install_update_retries_latest_when_explicit_version_is_rejected(monkeyp
     monkeypatch.setattr(automod, '_poll_update_install_result', fake_poll)
     op = automod.install_update(db, inst, upd, actor='test')
     assert op.status == 'succeeded'
+    assert json.loads(op.details_json)['target_version'] == '1.1'
     assert calls == [
         {'entity_id': 'update.version_fussy', 'version': '1.1'},
         {'entity_id': 'update.version_fussy'},
@@ -566,7 +577,7 @@ def test_install_update_retries_latest_when_explicit_version_is_rejected(monkeyp
     db.close()
 
 
-def test_install_update_500_without_progress_requires_manual_intervention(monkeypatch):
+def test_install_update_500_without_progress_is_outcome_unknown(monkeypatch):
     db = SessionLocal()
     inst = Instance(friendly_name='Richmond Home', url='http://ha.local')
     db.add(inst); db.flush()
@@ -587,8 +598,8 @@ def test_install_update_500_without_progress_requires_manual_intervention(monkey
     monkeypatch.setattr(automod, 'append_vault_update_log', lambda *a, **k: None)
     monkeypatch.setattr(automod, '_poll_update_install_result', lambda *a, **k: (False, {'state':'on'}, {'installed_version':'2.9.11','latest_version':'2.9.12','in_progress':False}, [{'attempt':0,'in_progress':False}]))
     op = automod.install_update(db, inst, upd, actor='test')
-    assert op.status == 'manual_intervention_required'
-    assert len(json.loads(op.details_json)['install_attempts']) == 6
+    assert op.status == 'outcome_unknown'
+    assert len(json.loads(op.details_json)['install_attempts']) == 2
     assert 'Load failed' in op.state
     db.flush()
     assert db.query(Notification).filter_by(update_record_id=upd.id, severity='critical').count() == 1
@@ -777,7 +788,9 @@ def test_ui_fast_initial_load_and_pwa_assets_present():
     assert 'mobile-web-app-capable' in html
     assert "navigator.serviceWorker.register('/sw.js')" in html
     assert "const basePages=['Updates','Repairs','Recent activity','Settings'];" in html
-    assert "async function loadCore(){let [instances,updates]=await Promise.all([api('/api/instances'),api('/api/updates')]);" in html
+    assert "function initFleetController(){fleetController=FleetRefresh.createFleetRefreshController" in html
+    assert "async function refreshInitialFleet(){" in html
+    assert "intervalMs:30000" in html
     assert "api('/api/repairs')" in html
     assert 'Loading repairs…' in html
     assert 'display": "standalone"' in manifest
