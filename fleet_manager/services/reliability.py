@@ -211,6 +211,7 @@ def reconcile_operation(db: Session, op: Operation, *, adapter=None, now_value: 
         error = type(exc).__name__
     if verified:
         op.status = 'succeeded'; op.state = 'succeeded'; op.ended_at = current
+        op.error_code = None; op.error_message = None
         _save(op, {'verified': True, 'verified_at': current.isoformat()})
     else:
         deadline = aware_utc(op.deadline_at)

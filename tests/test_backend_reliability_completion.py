@@ -223,6 +223,8 @@ def test_automatic_backup_reconciliation_tracks_running_then_completed(db):
     )
     backup.status = 'verification_pending'
     backup.started_at = datetime(2026, 10, 2, 13, 0, tzinfo=timezone.utc)
+    backup.error_code = 'ReadTimeout'
+    backup.error_message = 'Home Assistant did not respond before the timeout'
 
     class RunningAdapter:
         def backup_info(self):
@@ -249,6 +251,8 @@ def test_automatic_backup_reconciliation_tracks_running_then_completed(db):
     assert backup.status == 'succeeded'
     assert record.status == 'completed'
     assert record.backup_id == 'automatic-123'
+    assert backup.error_code is None
+    assert backup.error_message is None
 
 
 def test_sync_and_notification_failures_do_not_echo_provider_text(db, monkeypatch):
