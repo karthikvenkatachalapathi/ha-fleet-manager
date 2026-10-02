@@ -173,6 +173,22 @@ class HomeAssistantAdapter:
         result = self.websocket_command('backup/info') or {}
         return result if isinstance(result, dict) else {}
 
+    def available_backup_services(self) -> list[str]:
+        """Return only backup service endpoints advertised by this HA instance."""
+        rows = self.get('/api/services')
+        advertised: set[str] = set()
+        for domain in rows if isinstance(rows, list) else []:
+            name = str(domain.get('domain') or '')
+            services = domain.get('services') or {}
+            for service in services if isinstance(services, dict) else {}:
+                advertised.add(f'/api/services/{name}/{service}')
+        preferred = [
+            '/api/services/backup/create_automatic',
+            '/api/services/backup/create',
+            '/api/services/hassio/backup_full',
+        ]
+        return [endpoint for endpoint in preferred if endpoint in advertised]
+
     def fix_repair(self, domain: str, issue_id: str):
         raise RuntimeError('No generic Home Assistant repairs fix command is available')
 

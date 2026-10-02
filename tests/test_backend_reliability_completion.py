@@ -171,6 +171,52 @@ def test_definitive_backup_service_rejection_tries_next_known_endpoint(db, monke
     assert record.backup_id == 'verified-backup'
 
 
+@pytest.mark.parametrize(
+    ('available', 'expected_endpoint'),
+    [
+        (['/api/services/backup/create_automatic'], '/api/services/backup/create_automatic'),
+        (['/api/services/backup/create'], '/api/services/backup/create'),
+        (['/api/services/hassio/backup_full'], '/api/services/hassio/backup_full'),
+    ],
+)
+def test_backup_uses_only_instance_advertised_service(db, monkeypatch, available, expected_endpoint):
+    inst = Instance(friendly_name='Capability matrix', url='http://ha.local')
+    db.add(inst); db.flush()
+    calls = []
+
+    class Adapter:
+        def __init__(self, *_): pass
+        def available_backup_services(self): return available
+        def post(self, path, payload):
+            calls.append(path)
+            return {'backup_id': 'capability-backup'}
+
+    monkeypatch.setattr(automation, 'HomeAssistantAdapter', Adapter)
+    monkeypatch.setattr(automation, 'CredentialService', lambda: type('C', (), {'get_instance_token': lambda self, db, iid: 't'})())
+    monkeypatch.setattr(automation, 'safe_append_diagnostic', lambda writer: True)
+    record = automation.create_instance_backup(db, inst, actor='test')
+    assert calls == [expected_endpoint]
+    assert record.status == 'completed'
+
+
+def test_backup_fails_without_submission_when_instance_advertises_no_backup_service(db, monkeypatch):
+    inst = Instance(friendly_name='No backup capability', url='http://ha.local')
+    db.add(inst); db.flush()
+    calls = []
+
+    class Adapter:
+        def __init__(self, *_): pass
+        def available_backup_services(self): return []
+        def post(self, path, payload): calls.append(path)
+
+    monkeypatch.setattr(automation, 'HomeAssistantAdapter', Adapter)
+    monkeypatch.setattr(automation, 'CredentialService', lambda: type('C', (), {'get_instance_token': lambda self, db, iid: 't'})())
+    monkeypatch.setattr(automation, 'safe_append_diagnostic', lambda writer: True)
+    record = automation.create_instance_backup(db, inst, actor='test')
+    assert calls == []
+    assert record.status == 'unsupported_or_failed'
+
+
 def test_monitor_partial_failure_is_persisted(db, monkeypatch):
     inst = Instance(friendly_name='Offline monitor', url='http://ha.local')
     db.add(inst); db.flush()

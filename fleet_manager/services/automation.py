@@ -706,11 +706,21 @@ def create_instance_backup(db: Session, inst: Instance, *, actor: str = 'user') 
     op.status = 'running'; op.state = 'running'
     try:
         response = None
-        backup_attempts = [
+        known_backup_attempts = [
             ('/api/services/backup/create', {'name': rec.name}),
             ('/api/services/backup/create_automatic', {}),
             ('/api/services/hassio/backup_full', {'name': rec.name, 'compressed': True}),
         ]
+        payload_by_endpoint = dict(known_backup_attempts)
+        if hasattr(adapter, 'available_backup_services'):
+            advertised = adapter.available_backup_services()
+            backup_attempts = [(endpoint, payload_by_endpoint[endpoint]) for endpoint in advertised if endpoint in payload_by_endpoint]
+            if not backup_attempts:
+                raise RuntimeError('Home Assistant instance does not advertise a supported backup service')
+        else:
+            # Compatibility for custom adapters; the production adapter always
+            # performs capability discovery before any mutation.
+            backup_attempts = known_backup_attempts
         last_error: Exception | None = None
         for endpoint, payload in backup_attempts:
             try:
