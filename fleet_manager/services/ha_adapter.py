@@ -1,10 +1,11 @@
 from __future__ import annotations
-import ipaddress, json, re, socket
+import ipaddress, json, re, socket, ssl
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import unescape
 from urllib.parse import urlparse
 import httpx
+import certifi
 from websockets.sync.client import connect
 from sqlalchemy.orm import Session
 from ..models import Instance, UpdateRecord, now
@@ -119,7 +120,9 @@ class HomeAssistantAdapter:
         parsed = urlparse(self.base)
         scheme = 'wss' if parsed.scheme == 'https' else 'ws'
         url = f'{scheme}://{parsed.netloc}/api/websocket'
-        with connect(url, open_timeout=timeout, close_timeout=2) as ws:
+        ssl_context = ssl.create_default_context(cafile=certifi.where()) if scheme == 'wss' else None
+        connection = connect(url, open_timeout=timeout, close_timeout=2, proxy=None, ssl=ssl_context) if ssl_context is not None else connect(url, open_timeout=timeout, close_timeout=2, proxy=None)
+        with connection as ws:
             hello = json.loads(ws.recv())
             if hello.get('type') != 'auth_required':
                 raise RuntimeError('Unexpected Home Assistant websocket handshake')

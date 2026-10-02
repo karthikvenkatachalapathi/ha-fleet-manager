@@ -798,6 +798,38 @@ def test_ui_fast_initial_load_and_pwa_assets_present():
     assert "if (url.pathname.startsWith('/api/')) return;" in sw
 
 
+def test_websocket_uses_certifi_ca_bundle_for_https_instances(monkeypatch):
+    from fleet_manager.services import ha_adapter as hamod
+
+    sentinel = object()
+    captured = {}
+    monkeypatch.setattr(hamod, 'resolve_host', lambda *_: None)
+    monkeypatch.setattr(hamod.ssl, 'create_default_context', lambda *, cafile: captured.update(cafile=cafile) or sentinel)
+
+    class FakeSocket:
+        replies = iter([
+            json.dumps({'type': 'auth_required'}),
+            json.dumps({'type': 'auth_ok'}),
+            json.dumps({'success': True, 'result': {'issues': []}}),
+        ])
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def recv(self): return next(self.replies)
+        def send(self, _payload): pass
+
+    def fake_connect(url, **kwargs):
+        captured.update(url=url, kwargs=kwargs)
+        return FakeSocket()
+
+    monkeypatch.setattr(hamod, 'connect', fake_connect)
+    inst = Instance(friendly_name='TLS HA', url='https://ha.example')
+    result = hamod.HomeAssistantAdapter(inst, 'token').websocket_command('repairs/list_issues')
+    assert result == {'issues': []}
+    assert captured['kwargs']['ssl'] is sentinel
+    assert captured['kwargs']['proxy'] is None
+    assert captured['cafile'] == hamod.certifi.where()
+
+
 def test_pwa_routes_served():
     from fleet_manager.app import app
     client = TestClient(app)
