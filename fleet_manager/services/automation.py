@@ -719,7 +719,14 @@ def create_instance_backup(db: Session, inst: Instance, *, actor: str = 'user') 
                 last_error = exc
                 details['attempts'].append({'endpoint': endpoint, 'ok': False, 'error': type(exc).__name__, 'message': safe_exception_message(exc)})
                 message = str(exc).lower()
-                definitively_unsupported = any(marker in message for marker in ('404', '405', 'not found', 'unknown service', 'service not found'))
+                status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                # These client responses prove HA rejected the request before
+                # execution, so trying the next known backup service cannot
+                # duplicate a backup. Authentication/conflict errors and all
+                # transport/5xx failures remain ambiguous and stop immediately.
+                definitively_unsupported = status_code in {400, 404, 405, 422} or any(
+                    marker in message for marker in ('not found', 'unknown service', 'service not found')
+                )
                 if not definitively_unsupported:
                     # A timeout, disconnect, or 5xx may mean HA accepted the
                     # request. Never submit a second backup in that ambiguity.

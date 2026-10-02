@@ -145,6 +145,31 @@ def test_ambiguous_backup_failure_is_not_resubmitted(db, monkeypatch):
     assert db.query(Operation).filter_by(instance_id=inst.id, kind='backup_create').one().status == 'outcome_unknown'
 
 
+def test_definitive_backup_service_rejection_tries_next_known_endpoint(db, monkeypatch):
+    import httpx
+
+    inst = Instance(friendly_name='Rejected backup endpoint', url='http://ha.local')
+    db.add(inst); db.flush()
+    calls = []
+
+    class Adapter:
+        def __init__(self, *_): pass
+        def post(self, path, payload):
+            calls.append(path)
+            if len(calls) == 1:
+                response = httpx.Response(400, request=httpx.Request('POST', 'http://ha.local' + path))
+                raise httpx.HTTPStatusError('definitive rejection', request=response.request, response=response)
+            return {'backup_id': 'verified-backup'}
+
+    monkeypatch.setattr(automation, 'HomeAssistantAdapter', Adapter)
+    monkeypatch.setattr(automation, 'CredentialService', lambda: type('C', (), {'get_instance_token': lambda self, db, iid: 't'})())
+    monkeypatch.setattr(automation, 'safe_append_diagnostic', lambda writer: True)
+    record = automation.create_instance_backup(db, inst, actor='test')
+    assert calls == ['/api/services/backup/create', '/api/services/backup/create_automatic']
+    assert record.status == 'completed'
+    assert record.backup_id == 'verified-backup'
+
+
 def test_monitor_partial_failure_is_persisted(db, monkeypatch):
     inst = Instance(friendly_name='Offline monitor', url='http://ha.local')
     db.add(inst); db.flush()
