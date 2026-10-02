@@ -169,6 +169,10 @@ class HomeAssistantAdapter:
         issues = result.get('issues') if isinstance(result, dict) else result
         return issues if isinstance(issues, list) else []
 
+    def backup_info(self) -> dict:
+        result = self.websocket_command('backup/info') or {}
+        return result if isinstance(result, dict) else {}
+
     def fix_repair(self, domain: str, issue_id: str):
         raise RuntimeError('No generic Home Assistant repairs fix command is available')
 

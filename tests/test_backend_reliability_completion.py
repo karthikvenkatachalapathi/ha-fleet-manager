@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -141,8 +142,8 @@ def test_ambiguous_backup_failure_is_not_resubmitted(db, monkeypatch):
     monkeypatch.setattr(automation, 'safe_append_diagnostic', lambda writer: True)
     rec = automation.create_instance_backup(db, inst, actor='test')
     assert calls == ['/api/services/backup/create']
-    assert rec.status == 'unsupported_or_failed'
-    assert db.query(Operation).filter_by(instance_id=inst.id, kind='backup_create').one().status == 'outcome_unknown'
+    assert rec.status == 'verification_pending'
+    assert db.query(Operation).filter_by(instance_id=inst.id, kind='backup_create').one().status == 'verification_pending'
 
 
 def test_definitive_backup_service_rejection_tries_next_known_endpoint(db, monkeypatch):
@@ -202,6 +203,52 @@ def test_skip_and_backup_verification_pending_operations_reconcile(db):
     assert backup.status == 'succeeded'
     assert record.status == 'completed'
     assert record.backup_id == 'backup-123'
+
+
+def test_automatic_backup_reconciliation_tracks_running_then_completed(db):
+    inst = Instance(friendly_name='Automatic backup', url='http://ha.local')
+    db.add(inst); db.flush()
+    record = BackupRecord(instance_id=inst.id, status='verification_pending', name='Fleet backup')
+    db.add(record); db.flush()
+    backup = create_operation(
+        db,
+        kind='backup_create',
+        instance=inst,
+        idempotency_key='backup:auto-reconcile',
+        details={
+            'backup_record_id': record.id,
+            'name': record.name,
+            'attempts': [{'endpoint': '/api/services/backup/create_automatic', 'ok': False}],
+        },
+    )
+    backup.status = 'verification_pending'
+    backup.started_at = datetime(2026, 10, 2, 13, 0, tzinfo=timezone.utc)
+
+    class RunningAdapter:
+        def backup_info(self):
+            return {
+                'state': 'create_backup',
+                'last_attempted_automatic_backup': '2026-10-02T08:00:01-05:00',
+                'backups': [],
+            }
+
+    reconcile_operation(db, backup, adapter=RunningAdapter(), now_value=datetime(2026, 10, 2, 13, 1, tzinfo=timezone.utc))
+    assert backup.status == 'reconnecting'
+    assert record.status == 'verification_pending'
+
+    class CompletedAdapter:
+        def backup_info(self):
+            return {
+                'state': 'idle',
+                'last_attempted_automatic_backup': '2026-10-02T08:00:01-05:00',
+                'last_completed_automatic_backup': '2026-10-02T08:02:00-05:00',
+                'backups': [{'backup_id': 'automatic-123', 'name': 'Automatic backup', 'date': '2026-10-02T13:02:00+00:00'}],
+            }
+
+    reconcile_operation(db, backup, adapter=CompletedAdapter(), now_value=datetime(2026, 10, 2, 13, 2, tzinfo=timezone.utc))
+    assert backup.status == 'succeeded'
+    assert record.status == 'completed'
+    assert record.backup_id == 'automatic-123'
 
 
 def test_sync_and_notification_failures_do_not_echo_provider_text(db, monkeypatch):

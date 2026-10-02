@@ -694,7 +694,7 @@ def create_instance_backup(db: Session, inst: Instance, *, actor: str = 'user') 
     adapter = HomeAssistantAdapter(inst, token)
     op = create_operation(db, kind='backup_create', instance=inst,
                           idempotency_key=f'backup_create:{inst.id}',
-                          recovery_action='verify_backup', details={'actor': actor})
+                          recovery_action='verify_backup', details={'actor': actor}, deadline_seconds=900)
     existing = db.query(BackupRecord).filter(BackupRecord.details_json.like(f'%"operation_id": {op.id}%')).order_by(BackupRecord.id.desc()).first()
     if existing and op.status in {'succeeded', 'verification_pending', 'outcome_unknown'}:
         return existing
@@ -702,6 +702,8 @@ def create_instance_backup(db: Session, inst: Instance, *, actor: str = 'user') 
     db.add(rec); db.flush()
     details = {'actor': actor, 'operation_id': op.id, 'request_id': op.request_id,
                'backup_record_id': rec.id, 'name': rec.name, 'attempts': []}
+    op.started_at = now()
+    op.status = 'running'; op.state = 'running'
     try:
         response = None
         backup_attempts = [
@@ -742,7 +744,7 @@ def create_instance_backup(db: Session, inst: Instance, *, actor: str = 'user') 
         rec.completed_at = now()
         op.status = 'succeeded' if verified else 'verification_pending'
         op.state = op.status
-        op.ended_at = rec.completed_at
+        op.ended_at = rec.completed_at if verified else None
         if verified:
             inst.last_successful_backup = rec.completed_at
             inst.backup_compliance_state = 'current'
@@ -751,12 +753,19 @@ def create_instance_backup(db: Session, inst: Instance, *, actor: str = 'user') 
         safe_append_diagnostic(lambda: append_vault_update_log(f'{ct_now()} — {inst.friendly_name} — backup created', [f'- Instance: {inst.friendly_name}', f'- Backup record ID: {rec.id}', f'- Backup ID: {rec.backup_id or "not returned"}', f'- Actor: {actor}', f'- Result: {rec.status}', f'- Operation ID: {op.id}']))
         audit(db, action='backup_created', resource_type='backup_record', resource_id=rec.id, instance_id=inst.id, request_id=op.request_id, result=op.status, metadata={'actor': actor, 'operation_id': op.id})
     except Exception as exc:
-        rec.status = 'unsupported_or_failed'; rec.completed_at = now()
-        op.status = 'outcome_unknown'; op.state = 'outcome_unknown'; op.ended_at = rec.completed_at
+        ambiguous = isinstance(exc, (TimeoutError, httpx.TimeoutException, httpx.TransportError)) or (
+            isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500
+        )
+        rec.status = 'verification_pending' if ambiguous else 'unsupported_or_failed'
+        rec.completed_at = None if ambiguous else now()
+        op.status = 'verification_pending' if ambiguous else 'failed'
+        op.state = op.status
+        op.ended_at = None if ambiguous else rec.completed_at
         op.error_code = type(exc).__name__; op.error_message = safe_exception_message(exc)
         details['error'] = {'type': type(exc).__name__, 'message': safe_exception_message(exc)}
-        create_notification(db, severity='warning', title=f'Home Assistant backup unavailable: {inst.friendly_name}', body=safe_exception_message(exc), instance_id=inst.id)
-        audit(db, action='backup_failed', resource_type='backup_record', resource_id=rec.id, instance_id=inst.id, request_id=op.request_id, result='failed', metadata={'error': type(exc).__name__, 'operation_id': op.id})
+        if not ambiguous:
+            create_notification(db, severity='warning', title=f'Home Assistant backup unavailable: {inst.friendly_name}', body=safe_exception_message(exc), instance_id=inst.id)
+        audit(db, action='backup_verification_pending' if ambiguous else 'backup_failed', resource_type='backup_record', resource_id=rec.id, instance_id=inst.id, request_id=op.request_id, result=op.status, metadata={'error': type(exc).__name__, 'operation_id': op.id})
     rec.details_json = json.dumps(details, default=str)
     op.details_json = json.dumps(details, default=str)
     return rec

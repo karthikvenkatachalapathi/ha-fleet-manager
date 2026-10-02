@@ -47,6 +47,15 @@ def aware_utc(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
+def parse_ha_datetime(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return aware_utc(datetime.fromisoformat(str(value).replace('Z', '+00:00')))
+    except (TypeError, ValueError):
+        return None
+
+
 def _safe(value: Any) -> Any:
     if isinstance(value, dict):
         error_code = value.get('type') or value.get('error_type') or value.get('error_code')
@@ -160,10 +169,29 @@ def reconcile_operation(db: Session, op: Operation, *, adapter=None, now_value: 
             verified = bool((target and attrs.get('skipped_version') == target) or state.get('state') in {'off', 'skipped'})
         elif op.kind == 'backup_create':
             d = _details(op)
-            response = adapter.get('/api/backup') if adapter else {}
+            response = adapter.backup_info() if adapter and hasattr(adapter, 'backup_info') else (adapter.get('/api/backup') if adapter else {})
             backups = response.get('backups') or (response.get('data') or {}).get('backups') or []
             expected_id, expected_name = d.get('backup_id'), d.get('name')
             match = next((b for b in backups if (expected_id and str(b.get('backup_id') or b.get('slug')) == str(expected_id)) or (expected_name and b.get('name') == expected_name)), None)
+            automatic_requested = any(
+                str(attempt.get('endpoint') or '').endswith('/backup/create_automatic')
+                for attempt in d.get('attempts') or []
+                if isinstance(attempt, dict)
+            )
+            if not match and automatic_requested:
+                started = aware_utc(op.started_at)
+                attempted = parse_ha_datetime(response.get('last_attempted_automatic_backup'))
+                completed = parse_ha_datetime(response.get('last_completed_automatic_backup'))
+                belongs_to_operation = bool(started and attempted and attempted >= started - timedelta(seconds=30))
+                if belongs_to_operation and response.get('state') == 'create_backup':
+                    op.status = 'reconnecting'; op.state = 'reconnecting'
+                    _save(op, {'verification': 'backup_in_progress'})
+                    return op
+                if belongs_to_operation and attempted is not None and completed and completed >= attempted:
+                    dated = [(parse_ha_datetime(b.get('date') or b.get('date_created')), b) for b in backups]
+                    candidates = [(created, b) for created, b in dated if created and created >= attempted - timedelta(seconds=30)]
+                    if candidates:
+                        match = max(candidates, key=lambda item: item[0])[1]
             verified = bool(match)
             if match:
                 backup_id = match.get('backup_id') or match.get('slug')
