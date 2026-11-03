@@ -7,13 +7,56 @@ const path = require('node:path');
 function deferred() { let resolve, reject; const promise = new Promise((r, j) => { resolve = r; reject = j; }); return { promise, resolve, reject }; }
 function payload(name, extra = {}) { return { instances: [{ id: 1, friendly_name: name, last_update_scan: '2026-10-02T10:00:00Z' }], updates: [{ id: 1, instance_id: 1, installation_state: 'available', skip_state: 'none', component: name }], operations: [], ...extra }; }
 
-test('latest refresh response wins when responses arrive out of order', async () => {
-  const first = deferred(); const second = deferred(); const calls = [];
-  const c = createFleetRefreshController({ fetchJson: path => { calls.push(path); if (path === '/api/instances?refresh=1') return calls.filter(x => x === path).length === 1 ? first.promise : second.promise; return []; } });
-  const older = c.refresh(); const newer = c.refresh();
-  second.resolve(payload('new').instances); await newer;
-  first.resolve(payload('old').instances); await older;
-  assert.equal(c.getState().instances[0].friendly_name, 'new');
+test('overlapping polling refreshes coalesce their GETs and settle together', async () => {
+  const first = deferred(); let instanceCalls = 0;
+  const c = createFleetRefreshController({ fetchJson: path => { if (path === '/api/instances?refresh=1') { instanceCalls++; return first.promise; } return []; } });
+  const one = c.refresh(); const two = c.refresh();
+  assert.equal(instanceCalls, 0); // fetch dispatch is deferred to the microtask
+  await Promise.resolve();
+  assert.equal(instanceCalls, 1);
+  first.resolve(payload('coalesced').instances);
+  await Promise.all([one, two]);
+  assert.equal(c.getState().instances[0].friendly_name, 'coalesced');
+});
+
+test('manual sync forces fresh reads and an older in-flight GET cannot overwrite them', async () => {
+  const old = deferred(); const sync = deferred(); let instanceCalls = 0;
+  const c = createFleetRefreshController({ fetchJson: path => {
+    if (path === '/api/sync-all') return sync.promise;
+    if (path === '/api/instances?refresh=1') return ++instanceCalls === 1 ? old.promise : Promise.resolve(payload('after-sync').instances);
+    return [];
+  }});
+  const before = c.refresh(); await Promise.resolve();
+  const manual = c.manualRefresh(); sync.resolve({ sync_failed: 0 }); await manual;
+  old.resolve(payload('old').instances); await before;
+  assert.equal(instanceCalls, 2);
+  assert.equal(c.getState().instances[0].friendly_name, 'after-sync');
+});
+
+test('core refresh completes while repairs remain pending and publishes repairs later', async () => {
+  const repairs = deferred();
+  const c = createFleetRefreshController({ paths: ['/core', '/repairs'], keys: ['instances', 'repairs'], nonBlockingKeys: ['repairs'], fetchJson: path => path === '/repairs' ? repairs.promise : [{ id: 1 }] });
+  await c.refresh();
+  assert.deepEqual(c.getState().instances, [{ id: 1 }]);
+  assert.equal(c.getState().repairsPending, true);
+  repairs.resolve([{ id: 9 }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(c.getState().repairs, [{ id: 9 }]);
+  assert.equal(c.getState().repairsPending, false);
+});
+
+test('background repairs failure clears pending and preserves existing repair records', async () => {
+  let fail = false;
+  const c = createFleetRefreshController({ paths: ['/core', '/repairs'], keys: ['instances', 'repairs'], nonBlockingKeys: ['repairs'], fetchJson: path => path === '/repairs' ? (fail ? Promise.reject(new Error('repair service unavailable')) : Promise.resolve([{ id: 5 }])) : [{ id: 1 }] });
+  await c.refresh();
+  fail = true;
+  await c.refresh();
+  assert.equal(c.getState().repairsPending, true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(c.getState().repairsPending, false);
+  assert.deepEqual(c.getState().repairs, []);
+  assert.equal(c.getState().status, 'partial');
+  assert.match(c.getState().error, /repair service unavailable/);
 });
 
 test('partial and unavailable instances are visible in status but unavailable updates are not pending by default', async () => {

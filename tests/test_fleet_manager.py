@@ -806,7 +806,8 @@ def test_ui_fast_initial_load_and_pwa_assets_present():
     assert "function initFleetController(){fleetController=FleetRefresh.createFleetRefreshController" in html
     assert "async function refreshInitialFleet(){" in html
     assert "intervalMs:30000" in html
-    assert "api('/api/repairs')" in html
+    assert "'/api/repairs?refresh=1'" in html
+    assert "nonBlockingKeys:['repairs']" in html
     assert 'Loading repairs…' in html
     assert 'display": "standalone"' in manifest
     assert 'start_url": "/"' in manifest

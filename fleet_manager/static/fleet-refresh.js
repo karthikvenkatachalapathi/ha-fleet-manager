@@ -33,30 +33,47 @@
     const clearIntervalFn = opts.clearIntervalFn || (id => clearInterval(id));
     const setTimeoutFn = opts.setTimeoutFn || ((fn, ms) => { const handle = setTimeout(fn, ms); handle.unref?.(); return handle; });
     let generation = 0, timer = null, staleTimer = null;
-    const state = { status: 'initial', instances: [], updates: [], operations: [], repairs: [], activity: [], lastSuccessfulRefreshAt: null, partialFailures: [], syncSummary: null, error: null, manualInFlight: false, refreshInFlight: false };
+    const state = { status: 'initial', instances: [], updates: [], operations: [], repairs: [], activity: [], lastSuccessfulRefreshAt: null, partialFailures: [], syncSummary: null, error: null, manualInFlight: false, refreshInFlight: false, repairsPending: false, repairsLoaded: false };
     const emit = () => opts.onChange && opts.onChange(getState());
     const getState = () => ({ ...state, partialFailures: [...state.partialFailures], instances: [...state.instances], updates: [...state.updates], operations: [...state.operations], repairs: [...state.repairs], activity: [...state.activity] });
     const endpointPaths = opts.paths || ['/api/instances?refresh=1', '/api/updates?refresh=1', '/api/operations?refresh=1', ...(opts.extraPaths || [])];
     const keys = opts.keys || ['instances', 'updates', 'operations', 'repairs', 'activity'];
+    const nonBlockingKeys = new Set(opts.nonBlockingKeys || []);
+    const reads = new Map();
+    function read(path, force) {
+      if (!force && reads.has(path)) return reads.get(path);
+      const promise = Promise.resolve().then(() => fetchJson(path)).finally(() => { if (reads.get(path) === promise) reads.delete(path); });
+      reads.set(path, promise); return promise;
+    }
 
     function scheduleStaleClock() {
       if (staleTimer !== null) return;
       staleTimer = setTimeoutFn(() => { staleTimer = null; markStale(); }, intervalMs * 2);
     }
-    async function refresh() {
+    async function refresh(forceFresh) {
       const requestGeneration = ++generation;
       state.refreshInFlight = true;
+      state.repairsPending = endpointPaths.some((path, index) => keys[index] === 'repairs' && nonBlockingKeys.has('repairs'));
       state.status = state.lastSuccessfulRefreshAt === null ? 'initial' : 'stale';
       state.error = null;
       emit();
-      const results = await Promise.all(endpointPaths.map(path => Promise.resolve().then(() => fetchJson(path)).then(value => ({ value })).catch(error => ({ error, path }))));
+      const blocking = [], background = [];
+      endpointPaths.forEach((path, index) => {
+        const target = nonBlockingKeys.has(keys[index]) ? background : blocking;
+        target.push({ path, index, promise: read(path, !!forceFresh) });
+      });
+      const settle = async item => { try { return { value: await item.promise, path: item.path, index: item.index }; } catch (error) { return { error, path: item.path, index: item.index }; } };
+      // Attach rejection handlers before awaiting core reads: a fast background failure
+      // must never become an unhandled rejection while core endpoints are still pending.
+      const backgroundSettled = background.map(item => settle(item));
+      const results = await Promise.all(blocking.map(settle));
       if (requestGeneration !== generation) return false;
       const failures = results.filter(result => result.error).map(result => ({ endpoint: result.path, message: result.error.message || String(result.error) }));
-      results.forEach((result, index) => { if (!result.error) state[keys[index]] = Array.isArray(result.value) ? result.value : (result.value || []); });
+      results.forEach(result => { if (!result.error) state[keys[result.index]] = Array.isArray(result.value) ? result.value : (result.value || []); });
       state.partialFailures = failures;
       if (!failures.length) {
         state.lastSuccessfulRefreshAt = now();
-        state.status = state.syncSummary?.sync_failed ? 'partial' : 'current';
+        state.status = state.syncSummary?.sync_failed ? 'partial' : (background.length ? 'partial' : 'current');
         state.error = state.syncSummary?.sync_failed ? syncFailureText(state.syncSummary) : null;
         scheduleStaleClock();
       } else {
@@ -65,7 +82,21 @@
         state.status = state.lastSuccessfulRefreshAt ? 'failed' : (results.some(result => !result.error) ? 'partial' : 'unavailable');
       }
       state.refreshInFlight = false;
+      state.repairsPending = background.some(item => keys[item.index] === 'repairs');
       emit();
+      background.forEach((item, backgroundIndex) => {
+        backgroundSettled[backgroundIndex].then(result => {
+        if (requestGeneration !== generation) return;
+        if (result.error) {
+          state.partialFailures = [...state.partialFailures.filter(f => f.endpoint !== item.path), { endpoint: item.path, message: result.error.message || String(result.error) }];
+          state.error = [state.syncSummary?.sync_failed ? syncFailureText(state.syncSummary) : null, ...state.partialFailures.map(f => `${f.endpoint}: ${f.message}`)].filter(Boolean).join('; ');
+          if (state.status !== 'failed' && state.status !== 'unavailable' && state.status !== 'stale') state.status = 'partial';
+        } else state[keys[item.index]] = Array.isArray(result.value) ? result.value : (result.value || []);
+        if (keys[item.index] === 'repairs') { state.repairsPending = false; if (!result.error) state.repairsLoaded = true; }
+        if (!state.partialFailures.length && !state.repairsPending && !state.syncSummary?.sync_failed && state.status !== 'stale') { state.status = 'current'; state.error = null; }
+        emit();
+        });
+      });
       return true;
     }
     function syncFailureText(summary) {
@@ -82,7 +113,7 @@
         } catch (error) {
           state.syncSummary = { sync_failed: 1, results: [{ ok: false, error: error.message || String(error) }] };
         }
-        try { await refresh(); } finally { state.manualInFlight = false; emit(); }
+        try { await refresh(true); } finally { state.manualInFlight = false; emit(); }
         return true;
       })();
     }
