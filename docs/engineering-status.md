@@ -92,6 +92,10 @@ No issue is Done. A review HOLD creates further work. An open PR or permission b
 3. Blockers / input: None requiring new user input for isolated continuation. Tracking-feature permission limits remain scoped to those features. Production, services, managed HA actions, credentials, profiles, skills, schedules and vault remain unchanged. Hermione is sole execution owner; Dumbledore receives frozen static inputs only. Overall release HOLD.
 4. ETA / percentage: 6–14 engineering days remaining, uncertain; reassess with monitoring and broader safety evidence. 0/19 = 0% closed-issue count only, not effort or readiness. This checkpoint describes the owning supported execution window, not a promise of continued execution after its process exits.
 
+## Execution-window boundary
+
+The platform explicitly exhausted this owning execution window after the checkpoint above. Work is paused, not complete. Exact private source, frozen evidence, remaining notification failures and next commands are preserved. The static reviewer was last observed running; no verdict or survival after owner exit is assumed. Parent-managed supported continuation must verify that process before launching another review. No new user decision is required for isolated development; no self-respawning loop or report-job change was created. Overall release HOLD; newly closed 0, latest approved-route inventory 19 open/0 closed excluding #1, 0/19 issue-count completion only. Estimate remains uncertain 6–14 engineering days.
+
 ## Estimate
 
 Remaining estimate: **6–14 engineering days**, not a delivery guarantee. Re-estimate after schema/recovery and security findings are experimentally bounded. Owner permission delays and production/user acceptance are not represented as engineering time.
