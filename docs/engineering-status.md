@@ -96,6 +96,13 @@ No issue is Done. A review HOLD creates further work. An open PR or permission b
 
 The platform explicitly exhausted this owning execution window after the checkpoint above. Work is paused, not complete. Exact private source, frozen evidence, remaining notification failures and next commands are preserved. The static reviewer was last observed running; no verdict or survival after owner exit is assumed. Parent-managed supported continuation must verify that process before launching another review. No new user decision is required for isolated development; no self-respawning loop or report-job change was created. Overall release HOLD; newly closed 0, latest approved-route inventory 19 open/0 closed excluding #1, 0/19 issue-count completion only. Estimate remains uncertain 6–14 engineering days.
 
+## Delayed review result — remediation required
+
+1. Completed / closed: Delayed process results were reconciled without changing source. The earlier scoped ownership PASS remains separate from the newer monitor. Latest monitor evidence remains 734 Python passes/two notification failures; no additional passing rerun is claimed. Newly closed 0; total closed 0/19.
+2. Open / next: Initial monitor static review retains HOLD and identifies two whole-HTTP-entrypoint correction/evidence requirements. Its runner exited at a tool-call limit before the required final full hash recheck, so this is not completed source acceptance. Preserve findings and failures, reproduce/correct them, refresh frozen evidence and obtain completed independent re-review. The separate D–F design judgment conditionally supports isolated implementation only; it does not permit runtime gates or accept implementation. Last verified inventory remains 19 open/0 closed excluding #1; no fresh inventory is inferred from these notifications.
+3. Blockers / input: No new user decision. The owning execution window remains paused at its platform limit. The reviewer has exited; no reviewer or implementation continuation is claimed running. Production and protected operations remain unchanged; overall release HOLD.
+4. ETA / percentage: Uncertain 6–14 engineering days; 0/19 = 0% closed-issue count only, not effort/readiness. Exact findings and next isolated reproductions are retained privately; no sensitive reproduction detail or implementation patch is published here.
+
 ## Estimate
 
 Remaining estimate: **6–14 engineering days**, not a delivery guarantee. Re-estimate after schema/recovery and security findings are experimentally bounded. Owner permission delays and production/user acceptance are not represented as engineering time.
