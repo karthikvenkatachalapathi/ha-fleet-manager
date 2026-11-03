@@ -6,6 +6,7 @@
 - Establish the standing directive, engineering-status checkpoint, and risk-prioritized GitHub issue tracking.
 - Preserve corrected safety-candidate lineage for subsequent scoped remediation and independent validation.
 - Record a separately preserved, isolated schema/concurrency/frontend milestone, actual synthetic evidence, independent-review HOLD, and a reproduced next-workstream acceptance failure without publishing restricted implementation details.
+- Record the privately preserved history/source milestone, scoped independent review passes, 469 passing Python tests, 84 Node tests and four limited Chromium journeys, alongside five separately failing next-workstream ownership/transaction probes. No issue closure or production-readiness claim follows.
 
 This development candidate is **not approved for deployment or release**. Historical isolated passes do not establish current production readiness. No version bump or release publication has been performed.
 
