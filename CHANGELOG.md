@@ -5,6 +5,7 @@
 - Preserve the previously developed refresh responsiveness and anonymous-loading changes on an isolated engineering branch.
 - Establish the standing directive, engineering-status checkpoint, and risk-prioritized GitHub issue tracking.
 - Preserve corrected safety-candidate lineage for subsequent scoped remediation and independent validation.
+- Record a separately preserved, isolated schema/concurrency/frontend milestone, actual synthetic evidence, independent-review HOLD, and a reproduced next-workstream acceptance failure without publishing restricted implementation details.
 
 This development candidate is **not approved for deployment or release**. Historical isolated passes do not establish current production readiness. No version bump or release publication has been performed.
 
