@@ -416,7 +416,8 @@ def test_fleet_manager_ui_has_unrestricted_update_actions_and_oidc_settings():
     assert "function updateIsVisible(u){return u.installation_state==='unavailable'||u.in_progress||!sameVersion(u)}" in html
     assert "function updateIsPending(u){return u.installation_state!=='unavailable'&&(u.in_progress||(u.installation_state==='available'&&u.skip_state!=='skipped'))}" in html
     assert "data.updates.filter(updateIsVisible)" in html
-    assert "await refreshInitialFleet()" in html
+    # Shell/navigation must be usable before saved fleet records finish loading.
+    assert "void refreshInitialFleet().catch" in html
     assert "FleetRefresh.createFleetRefreshController" in html
     assert "await fleetController.manualRefresh()" not in html
     assert "function syncAll(){" in html
@@ -470,6 +471,8 @@ def test_install_update_requests_native_backup_when_supported(monkeypatch):
                     return {'state':'on','attributes':{'installed_version':'1.0','latest_version':'1.1','supported_features':8}}
                 return {'state':'off','attributes':{'installed_version':'1.1','latest_version':'1.1','in_progress':False}}
             return {}
+        def list_repairs(self):
+            return []
         def post(self, path, payload):
             calls.append((path, payload.copy()))
             return {'ok': True}
@@ -510,7 +513,8 @@ def test_skip_update_calls_ha_skip_without_version(monkeypatch):
             calls.append((path, payload.copy()))
             return {'ok': True}
         def get(self, path):
-            return {'state': 'off', 'attributes': {'skipped_version': '1.1'}}
+            # The strengthened skip preflight requires the selected latest version.
+            return {'state': 'off', 'attributes': {'latest_version': '1.1', 'skipped_version': '1.1'}}
 
     import fleet_manager.services.automation as automod
     monkeypatch.setattr(automod, 'CredentialService', FakeCreds)
@@ -553,7 +557,7 @@ def test_install_update_timeout_returns_accepted_not_exception(monkeypatch):
     db.close()
 
 
-def test_install_update_retries_latest_when_explicit_version_is_rejected(monkeypatch):
+def test_install_update_does_not_retry_unpinned_latest_after_ambiguous_500(monkeypatch):
     db = SessionLocal()
     inst = Instance(friendly_name='FallbackHA', url='http://ha.local')
     db.add(inst); db.flush()
@@ -583,12 +587,10 @@ def test_install_update_retries_latest_when_explicit_version_is_rejected(monkeyp
         return False, {'state':'on','attributes':{'installed_version':'1.0','latest_version':'1.1','in_progress':False}}, {'installed_version':'1.0','latest_version':'1.1','in_progress':False}, [{'attempt':0,'in_progress':False}]
     monkeypatch.setattr(automod, '_poll_update_install_result', fake_poll)
     op = automod.install_update(db, inst, upd, actor='test')
-    assert op.status == 'succeeded'
+    # A 500 does not prove the first POST was rejected. Never submit 'latest'.
+    assert op.status == 'outcome_unknown'
     assert json.loads(op.details_json)['target_version'] == '1.1'
-    assert calls == [
-        {'entity_id': 'update.version_fussy', 'version': '1.1'},
-        {'entity_id': 'update.version_fussy'},
-    ]
+    assert calls == [{'entity_id': 'update.version_fussy', 'version': '1.1'}]
     db.close()
 
 
@@ -614,10 +616,12 @@ def test_install_update_500_without_progress_is_outcome_unknown(monkeypatch):
     monkeypatch.setattr(automod, '_poll_update_install_result', lambda *a, **k: (False, {'state':'on'}, {'installed_version':'2.9.11','latest_version':'2.9.12','in_progress':False}, [{'attempt':0,'in_progress':False}]))
     op = automod.install_update(db, inst, upd, actor='test')
     assert op.status == 'outcome_unknown'
-    assert len(json.loads(op.details_json)['install_attempts']) == 2
-    assert 'Load failed' in op.state
+    assert len(json.loads(op.details_json)['install_attempts']) == 1
+    assert 'unverified' in op.state
+    assert upd.installed_version == '2.9.11'
+    # Unverified is not a definitive installation failure; do not manufacture an alert.
     db.flush()
-    assert db.query(Notification).filter_by(update_record_id=upd.id, severity='critical').count() == 1
+    assert db.query(Notification).filter_by(update_record_id=upd.id, severity='critical').count() == 0
     db.close()
 
 
@@ -807,7 +811,7 @@ def test_ui_fast_initial_load_and_pwa_assets_present():
     assert "async function refreshInitialFleet(){" in html
     assert "intervalMs:30000" in html
     assert "'/api/repairs?refresh=1'" in html
-    assert "nonBlockingKeys:['repairs']" in html
+    assert "nonBlockingKeys:['repairs','operations']" in html
     assert 'Loading repairs…' in html
     assert 'display": "standalone"' in manifest
     assert 'start_url": "/"' in manifest

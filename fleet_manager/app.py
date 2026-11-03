@@ -160,69 +160,80 @@ def parse_schedule_seconds(value: str | None) -> int:
 
 def run_update_discovery(db: Session, *, actor: str = 'scheduler') -> dict:
     job = JobRun(kind='update_discovery', status='running', started_at=now(), details_json='{}')
-    db.add(job); db.flush()
-    summary = {'instances': 0, 'sync_ok': 0, 'sync_failed': 0, 'results': []}
+    db.add(job); db.commit()
+    job_id=job.id
+    summary={'instances':0,'sync_ok':0,'sync_failed':0,'results':[]}
+    instance_ids=[i.id for i in db.query(Instance).order_by(Instance.friendly_name).all()]
+    for instance_id in instance_ids:
+        summary['instances']+=1
+        try:
+            inst=db.get(Instance,instance_id)
+            if inst is None: raise RuntimeError('Instance no longer exists')
+            token=CredentialService().get_instance_token(db,instance_id)
+            # Autoflush must not turn health metadata into a network-held writer.
+            with db.no_autoflush:
+                persist_instance_health(db,inst,token)
+                pending=sync_updates(db,inst,token)
+            db.commit()
+            summary['sync_ok']+=1
+            summary['results'].append({'instance_id':instance_id,'ok':True,'pending':pending})
+        except Exception as exc:
+            db.rollback()
+            summary['sync_failed']+=1
+            summary['results'].append({'instance_id':instance_id,'ok':False,'error':safe_exception_message(exc)})
+        job=db.get(JobRun,job_id); job.details_json=json.dumps(summary)
+        db.commit()
+    job=db.get(JobRun,job_id)
+    job.status='partial_failed' if summary['sync_failed'] else 'succeeded'; job.ended_at=now(); job.details_json=json.dumps(summary)
+    audit(db,action='scheduled_update_check_completed',resource_type='job_run',resource_id=job_id,result=job.status,metadata=summary)
+    return summary
+
+def run_schedule_cycle():
     try:
-        for inst in db.query(Instance).order_by(Instance.friendly_name).all():
-            summary['instances'] += 1
-            try:
-                token = CredentialService().get_instance_token(db, inst.id)
-                persist_instance_health(db, inst, token)
-                pending = sync_updates(db, inst, token)
-                summary['sync_ok'] += 1
-                summary['results'].append({'instance_id': inst.id, 'ok': True, 'pending': pending})
-            except Exception as exc:
-                summary['sync_failed'] += 1
-                summary['results'].append({'instance_id': inst.id, 'ok': False, 'error': safe_exception_message(exc)})
-        job.status='partial_failed' if summary['sync_failed'] else 'succeeded'; job.ended_at=now(); job.details_json=json.dumps(summary)
-        audit(db, action='scheduled_update_check_completed', resource_type='job_run', resource_id=job.id, result=job.status, metadata=summary)
-        return summary
+        # Reconcile durable operations continuously, not only after a
+        # process restart. This is read-only against Home Assistant.
+        with SessionLocal() as reconcile_db:
+            def reconcile_adapter_factory(instance_id):
+                instance = reconcile_db.get(Instance, instance_id)
+                if not instance:
+                    raise LookupError('instance not found')
+                token = CredentialService().get_instance_token(reconcile_db, instance_id)
+                return HomeAssistantAdapter(instance, token)
+            reconcile_startup(reconcile_db, adapter_factory=reconcile_adapter_factory)
+        from .services.bulk import run_cycle
+        run_cycle(SessionLocal)
+        with SessionLocal() as db:
+            sched = db.query(Schedule).filter(Schedule.enabled == True, Schedule.kind.in_(['update_discovery','monitor_and_act'])).order_by(Schedule.id).first()
+            if sched:
+                interval = parse_schedule_seconds(sched.cron)
+                last_run_at = sched.last_run_at
+                if last_run_at and last_run_at.tzinfo is None:
+                    last_run_at = last_run_at.replace(tzinfo=timezone.utc)
+                due = not last_run_at or (now() - last_run_at).total_seconds() >= interval
+                if due:
+                    if sched.kind == 'monitor_and_act':
+                        monitor_and_act(db, auto_execute=False, actor='scheduler')
+                    else:
+                        run_update_discovery(db, actor='scheduler')
+                    sched.last_run_at = now()
+                    db.commit()
     except Exception as exc:
-        job.status='failed'; job.ended_at=now(); job.details_json=json.dumps({'error': type(exc).__name__, **summary})
-        audit(db, action='scheduled_update_check_failed', resource_type='job_run', resource_id=job.id, result='failed', metadata={'error': type(exc).__name__})
-        raise
+        # Never silently lose scheduler failures: persist a diagnostic run.
+        try:
+            with SessionLocal() as error_db:
+                failed = JobRun(kind='scheduler_loop', status='failed', started_at=now(), ended_at=now(),
+                                details_json=json.dumps({'error': type(exc).__name__, 'message': safe_exception_message(exc)}))
+                error_db.add(failed); error_db.flush()
+                audit(error_db, action='scheduler_loop_failed', resource_type='job_run', resource_id=failed.id,
+                      result='failed', metadata={'error': type(exc).__name__})
+                error_db.commit()
+        except Exception:
+            pass
 
 async def schedule_loop():
     await asyncio.sleep(10)
     while True:
-        try:
-            # Reconcile durable operations continuously, not only after a
-            # process restart. This is read-only against Home Assistant.
-            with SessionLocal() as reconcile_db:
-                def reconcile_adapter_factory(instance_id):
-                    instance = reconcile_db.get(Instance, instance_id)
-                    if not instance:
-                        raise LookupError('instance not found')
-                    token = CredentialService().get_instance_token(reconcile_db, instance_id)
-                    return HomeAssistantAdapter(instance, token)
-                reconcile_startup(reconcile_db, adapter_factory=reconcile_adapter_factory)
-            with SessionLocal() as db:
-                sched = db.query(Schedule).filter(Schedule.enabled == True, Schedule.kind.in_(['update_discovery','monitor_and_act'])).order_by(Schedule.id).first()
-                if sched:
-                    interval = parse_schedule_seconds(sched.cron)
-                    last_run_at = sched.last_run_at
-                    if last_run_at and last_run_at.tzinfo is None:
-                        last_run_at = last_run_at.replace(tzinfo=timezone.utc)
-                    due = not last_run_at or (now() - last_run_at).total_seconds() >= interval
-                    if due:
-                        if sched.kind == 'monitor_and_act':
-                            summary = monitor_and_act(db, auto_execute=False, actor='scheduler')
-                        else:
-                            summary = run_update_discovery(db, actor='scheduler')
-                        sched.last_run_at = now()
-                        db.commit()
-        except Exception as exc:
-            # Never silently lose scheduler failures: persist a diagnostic run.
-            try:
-                with SessionLocal() as error_db:
-                    failed = JobRun(kind='scheduler_loop', status='failed', started_at=now(), ended_at=now(),
-                                    details_json=json.dumps({'error': type(exc).__name__, 'message': safe_exception_message(exc)}))
-                    error_db.add(failed); error_db.flush()
-                    audit(error_db, action='scheduler_loop_failed', resource_type='job_run', resource_id=failed.id,
-                          result='failed', metadata={'error': type(exc).__name__})
-                    error_db.commit()
-            except Exception:
-                pass
+        await asyncio.to_thread(run_schedule_cycle)
         await asyncio.sleep(60)
 
 def startup_init():
@@ -244,16 +255,56 @@ async def start_scheduler_task():
     asyncio.create_task(schedule_loop())
 
 def current_session(request: Request, db: Session = Depends(get_db)):
+    bearer=getattr(request.state,'api_principal',None)
+    if bearer is not None:
+        from .services.api_auth import revalidate_principal
+        from .services.api_policy import bind_scope, authorize_route
+        current=revalidate_principal(db,bearer)
+        authorize_route(current,request.method,request.url.path)
+        bind_scope(db,current)
+        return current
+    if request.headers.get('authorization') is not None:
+        raise HTTPException(401,'Invalid bearer authentication')
     s=validate_session(db, request.cookies.get(SESSION_COOKIE))
-    if not s: raise HTTPException(401, 'Authentication required')
+    if not s or not s.user.is_active: raise HTTPException(401, 'Authentication required')
     return s
 
 def csrf(request: Request, s=Depends(current_session)):
+    if getattr(request.state,'api_principal',None) is not None:return s
     if request.method not in {'GET','HEAD','OPTIONS'}:
         if request.headers.get(CSRF_HEADER) != s.csrf_token:
             raise HTTPException(403, 'CSRF validation failed')
     return s
 
+
+from .access_routes import register_access_routes
+register_access_routes(app,current_session,csrf)
+from .services.api_middleware import register_bearer_boundary
+register_bearer_boundary(app)
+
+@app.get('/api/auth/whoami')
+def api_whoami(s=Depends(current_session)):
+    if hasattr(s,'principal_id'):
+        return {'actor_type':'api','principal_id':s.principal_id,'token_id':s.token_id,
+                'role':s.role,'instance_ids':sorted(s.instance_ids),'all_instances':s.all_instances,
+                'include_future_instances':s.include_future_instances,'expires_at':s.expires_at.isoformat()}
+    return {'actor_type':'human','user_id':s.user_id,'role':s.user.role}
+
+@app.get('/api/policies/auto_update_policy')
+def api_update_policy(s=Depends(current_session),db:Session=Depends(get_db)):
+    require_permission(s,'modify_update_policies')
+    return load_auto_policy(db)
+
+@app.exception_handler(PermissionError)
+async def permission_denied(request,exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse({'detail':'Permission denied'},status_code=403)
+
+
+@app.exception_handler(PermissionError)
+async def permission_denied(request,exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse({'detail':'Permission denied'},status_code=403)
 
 @app.get('/manifest.webmanifest')
 def pwa_manifest():
@@ -265,6 +316,7 @@ def service_worker():
 
 @app.middleware('http')
 async def audit_mutating_api_requests(request: Request, call_next):
+    if request.headers.get('authorization') is not None:return await call_next(request)
     should_audit = request.method in {'POST', 'PATCH', 'PUT', 'DELETE'} and request.url.path.startswith('/api/')
     actor_user_id = None
     if should_audit:
@@ -911,10 +963,9 @@ def updates(s=Depends(current_session), db: Session = Depends(get_db)):
     require_permission(s,'view_updates'); inst={i.id:i for i in db.query(Instance).all()}
     rows=[]
     records = db.query(UpdateRecord).order_by(UpdateRecord.critical_state.desc(), UpdateRecord.last_discovered.desc()).all()
-    for u in records:
-        if u.installation_state == 'available' or '"in_progress": true' in (u.raw_json or '').lower():
-            refresh_pending_update_snapshot(db, u, inst.get(u.instance_id))
-    db.flush(); db.commit()
+    # The dashboard read serves the last scheduler-synced snapshot. Never put
+    # per-entity Home Assistant network I/O on this latency-sensitive path.
+    # Install still performs a live target-version preflight before dispatch.
     for u in records:
         d=serialize_update(u); d['instance']=inst.get(u.instance_id).friendly_name if inst.get(u.instance_id) else None; rows.append(d)
     return rows
@@ -931,14 +982,14 @@ def create_deployment(data: DeploymentPlanIn, s=Depends(csrf), db: Session = Dep
     return {'id':plan.id,'name':plan.name,'status':plan.status,'summary':summary}
 @app.get('/api/deployments')
 def deployment_list(s=Depends(current_session), db: Session = Depends(get_db)):
-    require_permission(s,'create_deployment_plans'); return [{'id':p.id,'name':p.name,'status':p.status,'created_at':p.created_at.isoformat(),'summary':_safe(json.loads(p.summary_json))} for p in db.query(DeploymentPlan).order_by(DeploymentPlan.id.desc()).all()]
+    require_permission(s,'view_updates' if hasattr(s,'principal_id') else 'create_deployment_plans'); return [{'id':p.id,'name':p.name,'status':p.status,'created_at':p.created_at.isoformat(),'summary':_safe(json.loads(p.summary_json))} for p in db.query(DeploymentPlan).order_by(DeploymentPlan.id.desc()).all()]
 @app.get('/api/audit')
 def audit_log(s=Depends(current_session), db: Session = Depends(get_db)):
     require_permission(s,'view_audit_history'); return [{'timestamp':a.timestamp.isoformat(),'actor_user_id':a.actor_user_id,'action':a.action,'resource_type':a.resource_type,'resource_id':a.resource_id,'instance_id':a.instance_id,'result':a.result,'metadata':_safe(json.loads(a.metadata_json or '{}'))} for a in db.query(AuditEvent).order_by(AuditEvent.id.desc()).limit(200).all()]
 
 @app.get('/api/approvals')
 def approvals(s=Depends(current_session), db: Session = Depends(get_db)):
-    require_permission(s,'create_deployment_plans')
+    require_permission(s,'view_updates' if hasattr(s,'principal_id') else 'create_deployment_plans')
     rows=[]
     updates={u.id:u for u in db.query(UpdateRecord).all()}
     instances={i.id:i for i in db.query(Instance).all()}
@@ -1012,58 +1063,17 @@ def install_single_update(update_id:int, s=Depends(csrf), db: Session = Depends(
     op=install_update(db, inst, upd, actor=f'user:{s.user.email}')
     db.commit(); return {'ok': op.status in {'succeeded','accepted','action_required'}, 'status': op.status, 'state': op.state, 'operation_id': op.id, 'update': serialize_update(upd), 'details': _safe(json.loads(op.details_json or '{}'))}
 
-@app.post('/api/updates/bulk')
+@app.post('/api/updates/bulk', status_code=202)
 def bulk_updates(data: BulkUpdateIn, s=Depends(csrf), db: Session = Depends(get_db)):
+    from .services.bulk import enqueue
     unique_ids = list(dict.fromkeys(int(x) for x in data.update_ids))
-    if not unique_ids:
-        raise HTTPException(422, 'Select at least one update')
+    if not unique_ids or len(unique_ids) > 500:
+        raise HTTPException(422, 'Select between 1 and 500 updates')
     action = data.action.lower().strip()
     if action not in {'update', 'skip', 'review'}:
         raise HTTPException(422, 'Action must be update, skip, or review')
-    require_permission(s, 'execute_updates' if action == 'update' else 'view_updates')
-    found = {u.id: u for u in db.query(UpdateRecord).filter(UpdateRecord.id.in_(unique_ids)).all()}
-    updates = [found[i] for i in unique_ids if i in found]
-    instances = {i.id: i for i in db.query(Instance).filter(Instance.id.in_({u.instance_id for u in updates})).all()}
-    policy = load_auto_policy(db)
-    batch_id = secrets.token_urlsafe(18)
-    job = JobRun(kind='bulk_update', status='running', started_at=now(), details_json='{}')
-    db.add(job); db.flush()
-    summary = {'action': action, 'batch_id': batch_id, 'job_id': job.id, 'selected': len(unique_ids), 'found': len(updates), 'updated': 0, 'action_required': 0, 'skipped': 0, 'reviewed': 0, 'blocked': [], 'failed': [], 'results': []}
-    for missing_id in [i for i in unique_ids if i not in found]:
-        item = {'update': missing_id, 'instance': None, 'operation': None, 'status': 'failed', 'reason': 'update_not_found'}
-        summary['failed'].append(item); summary['results'].append(item)
-    for upd in updates:
-        inst = instances.get(upd.instance_id)
-        item = {'update': upd.id, 'instance': inst.id if inst else None, 'operation': None, 'status': 'failed', 'reason': None}
-        try:
-            if not inst:
-                raise LookupError('instance_not_found')
-            if action in {'update', 'skip'} and (upd.installation_state != 'available' or (action == 'update' and upd.skip_state == 'skipped')):
-                item.update(status='blocked', reason='not_pending'); summary['blocked'].append(dict(item)); summary['results'].append(item); continue
-            if action == 'review':
-                ok, reasons, _notes = review_update_for_auto(upd, policy)
-                summary['reviewed'] += 1
-                item.update(status='reviewed' if ok else 'blocked', reason=None if ok else ','.join(reasons[:5]))
-                if not ok: summary['blocked'].append(dict(item))
-                audit(db, action='update_reviewed', resource_type='update_record', actor_user_id=s.user_id, resource_id=upd.id, instance_id=upd.instance_id, metadata={'eligible': ok, 'reasons': reasons, 'batch_id': batch_id})
-            else:
-                op = install_update(db, inst, upd, actor=f'user:{s.user.email}') if action == 'update' else skip_update(db, inst, upd, actor=f'user:{s.user.email}')
-                op.batch_id = op.batch_id or batch_id
-                item.update(operation=op.id, status=op.status, reason=None if op.status == 'succeeded' else op.state)
-                if op.status == 'succeeded':
-                    if action == 'update': summary['updated'] += 1
-                    else: summary['skipped'] += 1
-                elif op.status == 'action_required': summary['action_required'] += 1
-                else: summary['blocked'].append(dict(item))
-            summary['results'].append(item)
-        except Exception as exc:
-            item.update(status='failed', reason=safe_exception_message(exc))
-            summary['failed'].append(dict(item)); summary['results'].append(item)
-    job.status = 'partial_failed' if summary['failed'] or summary['blocked'] else 'succeeded'
-    job.ended_at = now(); job.details_json = json.dumps(summary, default=str)
-    audit(db, action='bulk_update_completed', resource_type='job_run', actor_user_id=s.user_id, resource_id=job.id, result=job.status, metadata={'batch_id': batch_id, 'selected': len(unique_ids), 'failed': len(summary['failed']), 'blocked': len(summary['blocked'])})
-    db.commit(); return summary
-
+    require_permission(s, 'execute_updates' if action in {'update', 'skip'} else 'view_updates')
+    return enqueue(db, update_ids=unique_ids, action=action, submitter=s)
 @app.get('/api/notifications')
 def notifications(s=Depends(current_session), db: Session = Depends(get_db)):
     require_permission(s,'view_audit_history')
@@ -1131,7 +1141,15 @@ def retry_operation(operation_id:int, s=Depends(csrf), db: Session = Depends(get
 @app.get('/api/jobs')
 def jobs(s=Depends(current_session), db: Session = Depends(get_db)):
     require_permission(s,'view_audit_history')
-    return [{'id':j.id,'kind':j.kind,'status':j.status,'started_at':j.started_at.isoformat(),'ended_at':j.ended_at.isoformat() if j.ended_at else None,'details':_safe(json.loads(j.details_json or '{}'))} for j in db.query(JobRun).order_by(JobRun.id.desc()).limit(100).all()]
+    from .services.bulk import read_summary
+    rows = []
+    for j in db.query(JobRun).order_by(JobRun.id.desc()).limit(100).all():
+        details = read_summary(db, j)
+        rows.append({'id': j.id, 'kind': j.kind, 'status': details.get('status', j.status),
+                     'started_at': j.started_at.isoformat(),
+                     'ended_at': j.ended_at.isoformat() if j.ended_at else None,
+                     'details': _safe(details)})
+    return rows
 
 @app.get('/api/backups')
 def backups(s=Depends(current_session), db: Session = Depends(get_db)):

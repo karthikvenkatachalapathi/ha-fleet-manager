@@ -9,7 +9,7 @@ const oidcSource = source.slice(source.indexOf('async function loadOidcConfig()'
 
 test('anonymous local login does not wait for pending SSO configuration', async () => {
   const events = [];
-  const context = vm.createContext({loadOidcConfig: () => new Promise(() => {}), api: async () => {events.push('session'); throw Error('unauthorized');}, showLogin: () => events.push('login'), data:{}});
+  const context = vm.createContext({loadOidcConfig: () => new Promise(() => {}), api: async () => {events.push('session'); throw Error('unauthorized');}, showLogin: () => events.push('login'), data:{}, $:()=>null});
   vm.runInContext(bootSource, context);
   context.boot();
   await new Promise(setImmediate);
@@ -20,7 +20,7 @@ test('authenticated session restores normally while SSO configuration remains pe
   const events=[];
   const context=vm.createContext({loadOidcConfig:()=>new Promise(()=>{}),api:async()=>({csrf_token:'test',user:{id:1}}),data:{},showApp:()=>events.push('app'),savedPage:()=> 'Updates',setPage:()=>{},refreshInitialFleet:async()=>events.push('restore'),route:()=>events.push('route'),showLogin:()=>events.push('login')});
   vm.runInContext(bootSource,context); context.boot(); await new Promise(setImmediate);
-  assert.deepEqual(events,['app','restore','route']);
+  assert.deepEqual(events,['app','route','restore']);
 });
 
 test('SSO configuration request is bounded and failure keeps SSO hidden', async () => {

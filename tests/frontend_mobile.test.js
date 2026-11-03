@@ -1,0 +1,6 @@
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
+const root=path.join(__dirname,'../fleet_manager/static');
+const css=fs.readFileSync(path.join(root,'fleet-mobile.css'),'utf8'),js=fs.readFileSync(path.join(root,'fleet-mobile.js'),'utf8'),html=fs.readFileSync(path.join(root,'index.html'),'utf8');
+test('mobile layer is linked and desktop styles remain scoped',()=>{assert.match(html,/fleet-mobile\.css\?v=30/);assert.match(html,/fleet-mobile\.js\?v=30/);assert.match(css,/@media \(max-width:760px\)/);assert.match(css,/@media \(min-width:761px\)/)});
+test('mobile layout provides compact metrics, readable forms, 44px actions and labeled tables',()=>{for(const pattern of [/repeat\(3,minmax\(0,1fr\)\)/,/font-size:16px!important;min-height:44px/,/min-height:44px/,/content:attr\(data-label\)/,/max-height:calc\(100dvh - 40px\)/])assert.match(css,pattern);assert.match(js,/cell\.dataset\.label=headings/)});
+test('mobile settings and filters preserve existing controls and selection actions',()=>{assert.match(js,/window\.setSettingsTab\(chooser.value\)/);assert.match(js,/controls\.appendChild\(x\)/);assert.match(js,/window\.toggleAll\(true\)/);assert.match(css,/selectionContext:not\(\.hasSelection\) \.toolbar/);assert.match(html,/b.disabled=n===0/)});

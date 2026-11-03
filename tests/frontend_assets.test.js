@@ -15,6 +15,6 @@ test('screen logo uses a compact separately versioned WebP while original remain
 
 test('new controller URL and service worker cache invalidate stale script',()=>{
  const html=fs.readFileSync(path.join(root,'index.html'),'utf8');const sw=fs.readFileSync(path.join(root,'sw.js'),'utf8');
- assert.match(html,/fleet-refresh\.js\?v=24/);assert.match(sw,/fleet-refresh\.js\?v=24/);
- assert.match(sw,/ha-fleet-manager-v24/);assert.match(sw,/ha-fleet-logo-256.webp/);
+ assert.match(html,/fleet-refresh\.js\?v=30/);assert.match(sw,/fleet-refresh\.js\?v=30/);
+ assert.match(sw,/ha-fleet-manager-v30/);assert.match(sw,/ha-fleet-logo-256.webp/);
 });

@@ -124,6 +124,7 @@ def test_accepted_install_reconciles_before_any_retry(db):
     class Adapter:
         def get(self, path):
             return {'state': 'off', 'attributes': {'installed_version': '2', 'latest_version': '2', 'in_progress': False}}
+        def list_repairs(self): return []
     reconcile_operation(db, op, adapter=Adapter())
     assert op.status == 'succeeded'
 
@@ -299,6 +300,49 @@ def test_automatic_backup_reconciliation_tracks_running_then_completed(db):
     assert record.backup_id == 'automatic-123'
     assert backup.error_code is None
     assert backup.error_message is None
+
+
+def test_failed_automatic_backup_reconciliation_is_observational_only(db):
+    inst = Instance(friendly_name='Automatic fallback', url='http://ha.local')
+    db.add(inst); db.flush()
+    record = BackupRecord(instance_id=inst.id, status='verification_pending', name='Fleet fallback backup')
+    db.add(record); db.flush()
+    backup = create_operation(
+        db,
+        kind='backup_create',
+        instance=inst,
+        idempotency_key='backup:auto-fallback',
+        details={
+            'backup_record_id': record.id,
+            'name': record.name,
+            'attempts': [{'endpoint': '/api/services/backup/create_automatic', 'ok': False}],
+        },
+    )
+    backup.status = 'reconnecting'
+    backup.started_at = datetime(2026, 10, 2, 13, 0, tzinfo=timezone.utc)
+    calls = []
+
+    class Adapter:
+        def backup_info(self):
+            return {
+                'state': 'idle',
+                'last_attempted_automatic_backup': '2026-10-02T08:00:01-05:00',
+                'last_completed_automatic_backup': None,
+                'backups': [],
+            }
+        def available_backup_services(self):
+            return ['/api/services/backup/create_automatic', '/api/services/hassio/backup_full']
+        def post(self, endpoint, payload):
+            calls.append((endpoint, payload))
+            return {'slug': 'supervisor-fallback-123'}
+
+    reconcile_operation(db, backup, adapter=Adapter(), now_value=datetime(2026, 10, 2, 13, 2, tzinfo=timezone.utc))
+    assert calls == []
+    assert backup.status == 'failed'
+    assert backup.error_code == 'automatic_backup_failed'
+    assert 'explicit new request required' in backup.state.lower()
+    assert record.status == 'failed'
+    assert json.loads(backup.details_json)['recovery'] == 'request_new_backup_explicitly'
 
 
 def test_sync_and_notification_failures_do_not_echo_provider_text(db, monkeypatch):

@@ -8,7 +8,9 @@ import httpx
 import certifi
 from websockets.sync.client import connect
 from sqlalchemy.orm import Session
-from ..models import Instance, UpdateRecord, now
+from sqlalchemy import text
+from hmac import compare_digest
+from ..models import Instance, InstanceCredential, UpdateRecord, Approval, now
 
 USER_AGENT = 'HomeAssistantFleetManager/0.1'
 BREAKING_PATTERNS = [r'breaking changes?', r'backward.?incompatible', r'action required', r'migration required', r'deprecated', r'removed', r'important', r'upgrade notes?']
@@ -92,6 +94,8 @@ class HomeAssistantAdapter:
             return r.json()
 
     def _post_allowed(self, path: str, payload: dict, *, timeout: int = 12):
+        from .api_policy import assert_live_access
+        assert_live_access(self.instance.id, write=True)
         with httpx.Client(follow_redirects=False, timeout=timeout, verify=True, trust_env=False) as client:
             r=client.post(self.base+path, headers=self._headers(), json=payload)
             if 300 <= r.status_code < 400:
@@ -167,7 +171,9 @@ class HomeAssistantAdapter:
     def list_repairs(self) -> list[dict]:
         result = self.websocket_command('repairs/list_issues') or {}
         issues = result.get('issues') if isinstance(result, dict) else result
-        return issues if isinstance(issues, list) else []
+        if not isinstance(issues, list) or any(not isinstance(i, dict) for i in issues):
+            raise ValueError('Home Assistant returned an invalid repairs response')
+        return issues
 
     def backup_info(self) -> dict:
         result = self.websocket_command('backup/info') or {}
@@ -194,14 +200,42 @@ class HomeAssistantAdapter:
 
     def discover_updates(self) -> list[dict]:
         states=self.get('/api/states')
-        updates=[]
+        # Validate the un-normalized HA envelope before it can be interpreted as
+        # an empty fleet. An actual [] is a valid observation.
+        if not isinstance(states, list):
+            raise ValueError('Home Assistant returned an invalid states response')
+        updates=[]; seen=set()
         for st in states:
-            eid=st.get('entity_id','')
+            if not isinstance(st, dict):
+                raise ValueError('Home Assistant returned an invalid state entry')
+            eid=st.get('entity_id')
+            if not isinstance(eid, str) or not eid:
+                raise ValueError('Home Assistant returned a state without an entity_id')
             if not eid.startswith('update.'):
                 continue
-            a=st.get('attributes') or {}
-            title=a.get('title') or a.get('friendly_name') or eid
-            updates.append({'entity_id':eid,'state':st.get('state'),'component':title,'installed_version':a.get('installed_version'),'available_version':a.get('latest_version'),'release_url':a.get('release_url'),'in_progress':a.get('in_progress'),'skipped_version':a.get('skipped_version'),'supported_features':a.get('supported_features'),'raw':st})
+            if eid in seen or not re.fullmatch(r'update\.[a-z0-9_]+',eid):
+                raise ValueError('Home Assistant returned duplicate or invalid update identities')
+            seen.add(eid)
+            state=st.get('state')
+            attrs=st.get('attributes')
+            if not isinstance(state, str) or not isinstance(attrs, dict):
+                raise ValueError('Home Assistant returned an invalid update state')
+            if state not in {'on','off','installing','updating','unknown','unavailable'}:
+                raise ValueError('Home Assistant returned an invalid update lifecycle state')
+            progress=attrs.get('in_progress')
+            if progress is not None and (not isinstance(progress,(bool,int,float)) or not 0<=progress<=100):
+                raise ValueError('Home Assistant returned invalid installation progress')
+            installed=attrs.get('installed_version'); available=attrs.get('latest_version')
+            if state not in {'unknown','unavailable'} and (installed is None or available is None):
+                state='unknown'
+            if installed is not None and not isinstance(installed, str):
+                raise ValueError('Home Assistant returned an invalid installed version')
+            if available is not None and not isinstance(available, str):
+                raise ValueError('Home Assistant returned an invalid available version')
+            title=attrs.get('title') or attrs.get('friendly_name') or eid
+            if not isinstance(title, str):
+                raise ValueError('Home Assistant returned an invalid update title')
+            updates.append({'entity_id':eid,'state':state,'component':title,'installed_version':installed,'available_version':available,'release_url':attrs.get('release_url'),'in_progress':attrs.get('in_progress'),'skipped_version':attrs.get('skipped_version'),'supported_features':attrs.get('supported_features'),'raw':st})
         return updates
 
 def persist_instance_health(db: Session, inst: Instance, token: str):
@@ -216,35 +250,92 @@ def persist_instance_health(db: Session, inst: Instance, token: str):
     except Exception:
         inst.connectivity_state='offline'; inst.health_state='offline'; inst.last_failed_connection=now(); raise
 
+def _snapshot_source(db: Session, instance_id: int):
+    # Column reads deliberately avoid an ORM identity-map's stale attributes.
+    return db.query(Instance.url, Instance.last_update_scan,
+        InstanceCredential.nonce, InstanceCredential.ciphertext, InstanceCredential.tag
+    ).outerjoin(InstanceCredential, InstanceCredential.instance_id == Instance.id).filter(Instance.id == instance_id).one_or_none()
+
+
+def _snapshot_rows(db: Session, instance_id: int):
+    return db.query(*UpdateRecord.__table__.columns).filter(UpdateRecord.instance_id == instance_id).order_by(UpdateRecord.id).all()
+
+
 def sync_updates(db: Session, inst: Instance, token: str) -> int:
-    adapter=HomeAssistantAdapter(inst, token)
-    updates=adapter.discover_updates()
-    pending=0; critical=0; approvals=0
-    seen=set()
+    # Collect first. Never acquire an observation write lock before HA I/O.
+    # The caller owns its commit; discovery commits each home before continuing.
+    with db.no_autoflush:
+        instance_id, source_url = inst.id, inst.url
+        source_before = _snapshot_source(db, instance_id)
+        rows_before = _snapshot_rows(db, instance_id)
+        if source_before is None or source_before.url != source_url:
+            raise RuntimeError('Home Assistant source changed; refresh again')
+        if source_before.nonce is not None:
+            from .credentials import CredentialService
+            configured = CredentialService().decrypt_parts(source_before.nonce, source_before.ciphertext, source_before.tag, f'instance:{instance_id}'.encode())
+            if not compare_digest(configured.encode(), token.encode()):
+                raise RuntimeError('Home Assistant credential changed; refresh again')
+        updates = HomeAssistantAdapter(inst, token).discover_updates()
+        if db.get_bind().dialect.name == 'sqlite':
+            # SQLite serializes all writers, including approval/source edits.
+            # A no-value-change write also upgrades pre-existing read transactions.
+            db.execute(text('UPDATE instances SET last_update_scan=last_update_scan WHERE id=:id'), {'id':instance_id})
+        else:
+            db.query(Instance).filter_by(id=instance_id).with_for_update().all()
+            db.query(InstanceCredential).filter_by(instance_id=instance_id).with_for_update().all()
+            db.query(UpdateRecord).filter_by(instance_id=instance_id).with_for_update().all()
+        if _snapshot_source(db, instance_id) != source_before or _snapshot_rows(db, instance_id) != rows_before:
+            # Reject the ENTIRE observation. No skipped row inherits fresh status.
+            raise RuntimeError('Fleet state changed during observation; refresh again')
+        return _apply_update_snapshot(db, inst, updates)
+
+
+def _apply_update_snapshot(db: Session, inst: Instance, updates: list[dict]) -> int:
+    rows = {r.entity_id:r for r in db.query(UpdateRecord).filter_by(instance_id=inst.id).populate_existing().all()}
+    pending=0; critical=0; approvals=0; seen=set(); observed_at=now()
     for u in updates:
-        seen.add(u['entity_id'])
-        same_version = u.get('installed_version') and u.get('available_version') and u.get('installed_version') == u.get('available_version')
-        is_pending = u.get('state') == 'on' and not same_version
-        is_skipped = bool(u.get('skipped_version') and u.get('available_version') and u.get('skipped_version') == u.get('available_version'))
-        if is_pending and not is_skipped: pending += 1
-        category=categorize(u.get('component') or '', u['entity_id'])
-        release_notes=None; breaking=False; excerpt=None
-        if u.get('release_url'):
-            release_notes=f"Release URL: {u['release_url']}"
-            breaking, excerpt = extract_breaking(release_notes)
-        risk, critical_state, manual_required, approval, explanation = risk_for(category, u.get('component') or '', breaking)
-        if is_pending and critical_state: critical += 1; approvals += 1
-        row=db.query(UpdateRecord).filter_by(instance_id=inst.id, entity_id=u['entity_id']).one_or_none()
+        eid=u['entity_id']; seen.add(eid); row=rows.get(eid)
         if row is None:
-            row=UpdateRecord(instance_id=inst.id, entity_id=u['entity_id']); db.add(row)
-        row.component=u.get('component') or u['entity_id']; row.category=category; row.installed_version=u.get('installed_version'); row.available_version=u.get('available_version')
-        row.release_url=u.get('release_url'); row.release_notes=sanitize_release_text(release_notes); row.breaking_state=breaking; row.breaking_excerpt=excerpt
-        row.risk_level=risk; row.critical_state=critical_state; row.manual_action_required=manual_required; row.approval_state='required' if is_pending and approval=='approval_required' else 'not_required'
-        row.installation_state='skipped' if is_skipped else ('available' if is_pending else 'current'); row.skip_state='skipped' if is_skipped else 'none'; row.restart_required=category in {'Core','OS','Supervisor'}; row.policy_decision=approval; row.policy_explanation=explanation
-        row.last_discovered=now(); row.raw_json=json.dumps(u.get('raw') or {}, default=str)[:20000]
-    for row in db.query(UpdateRecord).filter_by(instance_id=inst.id).all():
+            row=UpdateRecord(instance_id=inst.id, entity_id=eid, component=u.get('component') or eid); db.add(row)
+        old_target, old_decision = row.available_version, row.approval_state
+        if u.get('state') in {'unknown','unavailable'}:
+            row.installation_state='unavailable'; row.last_discovered=observed_at
+            row.raw_json=json.dumps(u.get('raw') or {}, default=str)[:20000]
+            # Absence is not a version change or a revocation of a decision.
+            continue
+        same_version=bool(u.get('installed_version') and u.get('available_version') and u['installed_version']==u['available_version'])
+        in_progress=bool(u.get('in_progress')) or u.get('state') in {'installing','updating'}
+        is_pending=in_progress or (u.get('state')=='on' and not same_version)
+        is_skipped=bool(u.get('skipped_version') and u.get('available_version') and u['skipped_version']==u['available_version'])
+        category=categorize(u.get('component') or '',eid)
+        release_notes=f"Release URL: {u['release_url']}" if u.get('release_url') else None
+        breaking,excerpt=extract_breaking(release_notes)
+        risk,critical_state,manual_required,approval,explanation=risk_for(category,u.get('component') or '',breaking)
+        decision='required' if is_pending and approval=='approval_required' else 'not_required'
+        if is_pending and old_target==u.get('available_version') and old_decision in {'approved','rejected'}:
+            decision=old_decision
+        if is_pending and row.id is not None:
+            durable=db.query(Approval).filter_by(update_record_id=row.id,target_version=u.get('available_version')).one_or_none()
+            if durable is not None and durable.status in {'approved','rejected'}: decision=durable.status
+        if is_pending and not is_skipped:
+            pending+=1
+            if critical_state:
+                critical+=1
+                if decision=='required': approvals+=1
+        row.component=u.get('component') or eid; row.category=category
+        row.installed_version=u.get('installed_version'); row.available_version=u.get('available_version')
+        row.release_url=u.get('release_url'); row.release_notes=sanitize_release_text(release_notes)
+        row.breaking_state=breaking; row.breaking_excerpt=excerpt
+        row.risk_level=risk; row.critical_state=critical_state; row.manual_action_required=manual_required; row.approval_state=decision
+        row.installation_state='skipped' if is_skipped else 'available' if is_pending else 'current'
+        row.skip_state='skipped' if is_skipped else 'none'
+        if is_pending: row.restart_required=category in {'Core','OS','Supervisor'}
+        row.policy_decision=approval; row.policy_explanation=explanation
+        row.last_discovered=observed_at; row.raw_json=json.dumps(u.get('raw') or {},default=str)[:20000]
+    for row in rows.values():
         if row.entity_id not in seen:
-            row.installation_state='unavailable'; row.approval_state='not_required'; row.critical_state=False; row.manual_action_required=False
-    inst.available_updates=pending; inst.critical_updates=critical; inst.pending_approvals=approvals; inst.last_update_scan=now()
-    if inst.connectivity_state == 'online' and critical: inst.health_state='warning'
+            row.installation_state='unavailable'; row.critical_state=False; row.manual_action_required=False
+            if row.approval_state not in {'approved','rejected'}: row.approval_state='not_required'
+    inst.available_updates=pending; inst.critical_updates=critical; inst.pending_approvals=approvals; inst.last_update_scan=observed_at
+    if inst.connectivity_state=='online': inst.health_state='warning' if critical else 'healthy'
     return pending

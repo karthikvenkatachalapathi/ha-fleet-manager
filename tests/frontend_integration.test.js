@@ -14,8 +14,8 @@ test('static integration wires one boot, immediate restore, 30 second polling, a
   assert.match(source, /refreshInitialFleet\(\)/);
   assert.match(source, /Repairs.*Active ops|Active ops.*Repairs/);
   assert.match(source, /intervalMs:30000/);
-  assert.match(worker, /'\/assets\/fleet-refresh\.js\?v=24'/);
-  assert.match(worker, /const CACHE = 'ha-fleet-manager-v24'/);
+  assert.match(worker, /'\/assets\/fleet-refresh\.js\?v=30'/);
+  assert.match(worker, /const CACHE = 'ha-fleet-manager-v30'/);
   assert.match(worker, /if \(url\.pathname\.startsWith\('\/api\/'\)\) return;/);
 });
 

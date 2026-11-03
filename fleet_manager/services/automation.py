@@ -428,15 +428,23 @@ def _poll_update_install_result(adapter: HomeAssistantAdapter, entity_id: str, t
 
 
 
-def _restart_repair_issues(adapter: HomeAssistantAdapter) -> list[dict]:
+def _restart_repair_issues(adapter: HomeAssistantAdapter) -> list[dict] | None:
     """Return active HA repair issues that mean the install is not fully complete yet."""
     issues: list[dict] = []
     try:
         raw_issues = adapter.list_repairs()
     except Exception:
-        return issues
+        return None  # unavailable evidence is not a verified empty repair list
+    if not isinstance(raw_issues, list) or any(not isinstance(i, dict) for i in raw_issues):
+        return None
     for issue in raw_issues:
-        placeholders = issue.get('translation_placeholders') or {}
+        if not isinstance(issue.get('domain'), str) or not issue['domain'] or not isinstance(issue.get('issue_id'), str) or not issue['issue_id']:
+            return None
+        placeholders = issue.get('translation_placeholders')
+        if placeholders is None:
+            placeholders = {}
+        if not isinstance(placeholders, dict):
+            return None
         text = ' '.join(str(x or '') for x in [
             issue.get('domain'),
             issue.get('issue_id'),
@@ -455,163 +463,157 @@ def _restart_repair_issues(adapter: HomeAssistantAdapter) -> list[dict]:
             })
     return issues
 
-def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: str = 'automation') -> Operation:
-    token = CredentialService().get_instance_token(db, inst.id)
+def install_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: str = 'automation', batch_id=None, dispatch_guard=None) -> Operation:
+    """Reserve and commit before I/O; exactly one version-pinned POST per intent."""
+    target, entity, iid, uid = update.available_version, update.entity_id, inst.id, update.id
+    if not target:
+        raise ValueError('missing_target_version')
+    key = f'update_install:{iid}:{entity}:{target}'
+    unresolved = db.query(Operation).filter(Operation.idempotency_key == key, Operation.status.in_(['outcome_unknown', 'manual_intervention_required'])).first()
+    if unresolved:
+        return unresolved
+    token = CredentialService().get_instance_token(db, iid)
     adapter = HomeAssistantAdapter(inst, token)
-    target = update.available_version or 'latest'
-    op = create_operation(db, kind='update_install', instance=inst,
-                          idempotency_key=f'update_install:{inst.id}:{update.entity_id}:{target}',
-                          recovery_action='reconcile_install',
-                          details={'update_id': update.id, 'entity_id': update.entity_id, 'target_version': target, 'actor': actor})
-    if op.status in {'succeeded', 'accepted', 'action_required'}:
+    op = create_operation(db, kind='update_install', instance=inst, idempotency_key=key,
+                          recovery_action='reconcile_install', batch_id=batch_id, deadline_seconds=1800,
+                          details={'update_id': uid, 'entity_id': entity, 'target_version': target, 'actor': actor, 'dispatch_protocol': 2})
+    if op.started_at is not None or op.status != 'queued':
         return op
-    op.status = 'running'; op.state = 'Preflight'; op.started_at = now(); op.attempt_count = (op.attempt_count or 0) + 1
-    db.flush()
-    before = adapter.get(f'/api/states/{update.entity_id}')
+    op.status = 'running'; op.state = 'Preflight'; op.started_at = now(); op.attempt_count = 1
+    db.commit()  # durable intent and released SQLite writer before the first GET
+    details = json.loads(op.details_json or '{}')
+    try:
+        before = adapter.get(f'/api/states/{entity}')
+    except Exception as exc:
+        op.status = 'failed'; op.state = 'Preflight failed — nothing dispatched'
+        op.error_code = type(exc).__name__; op.ended_at = now(); db.commit()
+        return op
     attrs = before.get('attributes') or {}
-    if attrs.get('latest_version') != update.available_version:
-        op.state = 'Blocked'; op.status = 'blocked'; op.ended_at = now(); op.details_json = json.dumps({'reason': 'target_version_changed', 'expected': update.available_version, 'actual': attrs.get('latest_version')})
+    in_progress = bool(attrs.get('in_progress')) or before.get('state') in {'installing', 'updating'}
+    already_installed = attrs.get('installed_version') == target and not in_progress
+    if not already_installed and attrs.get('latest_version') != target:
+        op.status = 'blocked'; op.state = 'target_version_changed'; op.ended_at = now()
+        details.update(reason='target_version_changed', expected=target, actual=attrs.get('latest_version'))
+        op.details_json = json.dumps(details); db.commit()
         return op
-    op.state = 'Installing'; db.flush()
-    payload = {'entity_id': update.entity_id}
-    if update.available_version:
-        payload['version'] = update.available_version
-    supported = int(attrs.get('supported_features') or 0)
-    if supported & UPDATE_FEATURE_BACKUP:
+    payload = {'entity_id': entity, 'version': target}
+    if int(attrs.get('supported_features') or 0) & UPDATE_FEATURE_BACKUP:
         payload['backup'] = True
-    response = None
-    post_exception = None
-    install_attempts: list[dict] = []
-    success = False
-    after: dict = {'state': 'unknown'}
-    after_attrs: dict = {}
-    observations: list[dict] = []
-    op.state = 'Installing'; db.flush()
-    payload_variants = [payload]
-    if payload.get('version'):
-        latest_payload = {k: v for k, v in payload.items() if k != 'version'}
-        payload_variants.append(latest_payload)
-    stop_attempts = False
-    for service_attempt in range(1, 4):
-        for variant_index, attempt_payload in enumerate(payload_variants, start=1):
-            attempt_exception = None
-            try:
-                response = adapter.post('/api/services/update/install', attempt_payload)
-                install_attempts.append({'attempt': service_attempt, 'variant': variant_index, 'service_payload': attempt_payload, 'service_response': 'ok'})
-            except Exception as exc:
-                # Some Home Assistant update platforms reject an explicit version but accept "install latest".
-                # Poll before reporting; do not mark a persistent 5xx as success just because preflight passed.
-                attempt_exception = {'type': type(exc).__name__, 'message': safe_exception_message(exc)}
-                post_exception = attempt_exception
-                install_attempts.append({'attempt': service_attempt, 'variant': variant_index, 'service_payload': attempt_payload, 'error_type': attempt_exception['type'], 'error': attempt_exception['message']})
-            op.state = 'Validating'; db.flush()
-            success, after, after_attrs, attempt_observations = _poll_update_install_result(adapter, update.entity_id, update.available_version)
-            observations.extend(attempt_observations)
-            observed_state = after.get('state') not in {None, 'unknown'}
-            made_progress = (
-                bool(after_attrs.get('in_progress'))
-                or (after_attrs.get('installed_version') is not None and after_attrs.get('installed_version') != attrs.get('installed_version'))
-                or (observed_state and after.get('state') in {'installing', 'updating'})
-            )
-            if success or made_progress or not attempt_exception:
-                stop_attempts = True
-                break
-        if stop_attempts:
-            break
-        # A POST exception is ambiguous.  We already reconciled HA state via
-        # the poll above; do not submit this non-idempotent action again.
-        if post_exception:
-            break
-        if service_attempt < 3:
-            op.state = f'Retrying install after Home Assistant error ({service_attempt}/3)'; db.flush()
+    post_exception, response, post_attempted = None, None, False
+    if not already_installed and not in_progress:
+        # Authorization is checked again immediately before reservation/dispatch.
+        if dispatch_guard:
+            dispatch_guard()
+        op.status = 'accepted'; op.state = 'Dispatch reserved; verification pending'
+        details.update(service_payload=payload, dispatch_reserved=True)
+        op.details_json = json.dumps(details); db.commit()
+        try:
+            if dispatch_guard:
+                dispatch_guard()  # fence/reauthorize after reservation, adjacent to the POST
+            post_attempted = True
+            response = adapter.post('/api/services/update/install', payload)
+        except Exception as exc:
+            from .bulk import LostLease, DispatchDenied
+            if isinstance(exc, (LostLease, DispatchDenied)):
+                raise
+            post_exception = {'type': type(exc).__name__, 'message': safe_exception_message(exc)}
+        # Neither a timeout nor 5xx proves rejection. Never fall back to an unpinned
+        # 'latest' request and never replay this non-idempotent service call.
+    db.commit()
+    success, after, after_attrs, observations = _poll_update_install_result(adapter, entity, target, attempts=1, delay=0)
     restart_repairs = _restart_repair_issues(adapter) if success else []
     if success:
         update.installation_state = 'installed'
-        update.installed_version = after_attrs.get('installed_version') or update.available_version
-        update.available_version = after_attrs.get('latest_version') or update.available_version
-        update.raw_json = json.dumps(after or {}, default=str)[:20000]
+        update.installed_version = target
+        update.available_version = after_attrs.get('latest_version') or target
+        update.raw_json = json.dumps(after, default=str)[:20000]
         update.approval_state = 'not_required'
-        if restart_repairs:
-            op.state = 'Installed — restart required'
-            op.status = 'action_required'
-            update.restart_required = True
+        if restart_repairs is None:
+            op.status = 'verification_pending'; op.state = 'Installed — restart clearance unverified'; op.ended_at = None
         else:
-            op.state = 'Succeeded'
-            op.status = 'succeeded'
-    elif post_exception:
-        observed_state = after.get('state') not in {None, 'unknown'}
-        made_progress = (
-            bool(after_attrs.get('in_progress'))
-            or (after_attrs.get('installed_version') is not None and after_attrs.get('installed_version') != attrs.get('installed_version'))
-            or (observed_state and after.get('state') in {'installing', 'updating'})
-        )
-        if made_progress:
-            op.state = 'Accepted by Home Assistant; verification pending'
-            op.status = 'accepted'
-            update.raw_json = json.dumps(after or {}, default=str)[:20000]
-        else:
-            op.state = 'Load failed — Home Assistant rejected update install'
-            op.status = 'outcome_unknown'
-            create_notification(db, severity='critical', title=f'Home Assistant update failed: {inst.friendly_name} / {update.component}', body=f'Install service failed for {update.entity_id}; version stayed at {attrs.get("installed_version") or "unknown"}. Check the instance directly.', instance_id=inst.id, update_id=update.id)
+            update.restart_required = bool(restart_repairs)
+            op.status = 'action_required' if restart_repairs else 'succeeded'
+            op.state = 'Installed — restart required' if restart_repairs else 'Succeeded'
+            op.ended_at = now()
     else:
-        op.state = 'Manual Intervention Required'
-        op.status = 'manual_intervention_required'
-        create_notification(db, severity='critical', title=f'Home Assistant update needs manual validation: {inst.friendly_name} / {update.component}', body=f'Install service returned but update still appears pending for {update.entity_id}.', instance_id=inst.id, update_id=update.id)
-    op.ended_at = now()
-    op.details_json = json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': update.available_version, 'backup_requested': bool(payload.get('backup')), 'service_payload': payload, 'service_response': response, 'post_exception': post_exception, 'install_attempts': install_attempts, 'restart_repairs': restart_repairs if 'restart_repairs' in locals() else [], 'before': {'state': before.get('state'), 'installed_version': attrs.get('installed_version'), 'latest_version': attrs.get('latest_version'), 'in_progress': attrs.get('in_progress'), 'update_percentage': attrs.get('update_percentage')}, 'after': {'state': after.get('state'), 'installed_version': after_attrs.get('installed_version'), 'latest_version': after_attrs.get('latest_version'), 'in_progress': after_attrs.get('in_progress'), 'update_percentage': after_attrs.get('update_percentage')}, 'validation_observations': observations[-12:]})
-    safe_append_diagnostic(lambda: append_vault_update_log(
-        f'{ct_now()} — {inst.friendly_name} — {update.component}',
-        [
-            f'- Instance: {inst.friendly_name}',
-            f'- Entity: `{update.entity_id}`',
-            f'- Version: `{attrs.get("installed_version")}` → `{update.available_version}`',
-            f'- Category: {update.category}',
-            f'- Actor: {actor}',
-            f'- Result: {op.state}',
-            f'- Release URL: {update.release_url or "not provided"}',
-            f'- Operation ID: {op.id}',
-        ],
-    ))
-    audit_action = 'update_install_action_required' if op.status == 'action_required' else ('update_install_executed' if op.status != 'accepted' else 'update_install_accepted_unverified')
-    audit(db, action=audit_action, resource_type='update_record', resource_id=update.id, instance_id=inst.id, result=op.status, metadata={'operation_id': op.id, 'target_version': update.available_version, 'actor': actor, 'post_exception': post_exception.get('type') if post_exception else None})
+        # A successful HTTP response is only acceptance, not verified installation.
+        progressing = bool(after_attrs.get('in_progress')) or after.get('state') in {'installing', 'updating'}
+        op.status = 'outcome_unknown' if post_exception and not progressing else 'accepted'
+        op.state = 'Accepted by Home Assistant; verification pending' if not post_exception or progressing else 'Install outcome unverified; inspect Home Assistant'
+        op.ended_at = now() if op.status == 'outcome_unknown' else None
+        if post_exception:
+            op.error_code = post_exception['type']
+            if not post_attempted:
+                op.status = 'blocked'; op.state = 'Authorization rejected before dispatch'; op.ended_at = now()
+    update.raw_json = json.dumps(after, default=str)[:20000]
+    details.update(backup_requested=bool(payload.get('backup')), service_payload=payload,
+                   service_response='accepted' if response is not None else None,
+                   post_exception=post_exception, restart_repairs=restart_repairs,
+                   install_attempts=[] if already_installed or in_progress else [{'attempt': 1, 'service_payload': payload, 'error_type': post_exception['type'] if post_exception else None}],
+                   before={k: attrs.get(k) for k in ['installed_version', 'latest_version', 'in_progress', 'update_percentage']},
+                   after={k: after_attrs.get(k) for k in ['installed_version', 'latest_version', 'in_progress', 'update_percentage']},
+                   validation_observations=observations)
+    op.details_json = json.dumps(details, default=str)
+    audit(db, action='update_install_executed' if success else 'update_install_accepted_unverified', resource_type='update_record', resource_id=uid, instance_id=iid, result=op.status, metadata={'operation_id': op.id, 'target_version': target, 'actor': actor})
+    db.commit()
+    safe_append_diagnostic(lambda: append_vault_update_log(f'{ct_now()} — {inst.friendly_name} — {update.component}', [f'- Entity: `{entity}`', f'- Target: `{target}`', f'- Result: {op.state}', f'- Operation ID: {op.id}']))
     return op
 
 
-def skip_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: str = 'user') -> Operation:
-    token = CredentialService().get_instance_token(db, inst.id)
+def skip_update(db: Session, inst: Instance, update: UpdateRecord, *, actor: str = 'user', batch_id=None, dispatch_guard=None) -> Operation:
+    target, entity, iid, uid = update.available_version, update.entity_id, inst.id, update.id
+    if not target:
+        raise ValueError('missing_target_version')
+    key = f'update_skip:{iid}:{entity}:{target}'
+    unresolved = db.query(Operation).filter(Operation.idempotency_key == key, Operation.status == 'outcome_unknown').first()
+    if unresolved:
+        return unresolved
+    token = CredentialService().get_instance_token(db, iid)
     adapter = HomeAssistantAdapter(inst, token)
-    target = update.available_version or 'latest'
-    op = create_operation(db, kind='update_skip', instance=inst,
-                          idempotency_key=f'update_skip:{inst.id}:{update.entity_id}:{target}',
-                          recovery_action='reconcile_skip',
-                          details={'update_id': update.id, 'entity_id': update.entity_id, 'target_version': target, 'actor': actor})
-    if op.status in {'succeeded', 'accepted', 'verification_pending', 'outcome_unknown'}:
+    op = create_operation(db, kind='update_skip', instance=inst, idempotency_key=key, batch_id=batch_id,
+                          recovery_action='reconcile_skip', details={'update_id': uid, 'entity_id': entity, 'target_version': target, 'actor': actor, 'dispatch_protocol': 2})
+    if op.started_at is not None or op.status != 'queued':
         return op
-    op.state = 'Skipping'; op.status = 'running'; op.started_at = now(); op.attempt_count = (op.attempt_count or 0) + 1
-    db.flush()
-    payload = {'entity_id': update.entity_id}
-    # HA's update.skip skips the current latest version for the entity; passing version is not universally supported.
+    op.state = 'Skip preflight'; op.status = 'running'; op.started_at = now(); op.attempt_count = 1
+    db.commit()
+    details = json.loads(op.details_json or '{}')
+    post_attempted = False
     try:
-        response = adapter.post('/api/services/update/skip', payload)
-        state = adapter.get(f'/api/states/{update.entity_id}')
-        attrs = state.get('attributes') or {}
-        verified = attrs.get('skipped_version') == update.available_version or state.get('state') in {'off', 'skipped'}
-        if not verified:
-            op.state = 'Verification pending'; op.status = 'verification_pending'; op.ended_at = now()
-            op.details_json = json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': update.available_version, 'service_payload': payload, 'service_response': response, 'verification': 'not_observable'})
+        before = adapter.get(f'/api/states/{entity}')
+        if (before.get('attributes') or {}).get('latest_version') != target:
+            op.status = 'blocked'; op.state = 'target_version_changed'; op.ended_at = now(); db.commit()
             return op
-        update.skip_state = 'skipped'
-        update.installation_state = 'skipped'
-        op.state = 'Skipped'; op.status = 'succeeded'; op.ended_at = now()
-        op.details_json = json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': update.available_version, 'service_payload': payload, 'service_response': response})
-        audit(db, action='update_skipped', resource_type='update_record', resource_id=update.id, instance_id=inst.id, result='success', metadata={'operation_id': op.id, 'actor': actor})
+        if dispatch_guard:
+            dispatch_guard()
+        op.status = 'verification_pending'; op.state = 'Skip dispatch reserved'
+        details['dispatch_reserved'] = True; op.details_json = json.dumps(details)
+        db.commit()
+        if dispatch_guard:
+            dispatch_guard()  # same post-reservation fence as install
+        post_attempted = True
+        adapter.post('/api/services/update/skip', {'entity_id': entity})
+        state = adapter.get(f'/api/states/{entity}')
+        attrs = state.get('attributes') or {}
+        verified = attrs.get('skipped_version') == target
+        if verified:
+            update.skip_state = 'skipped'; update.installation_state = 'skipped'
+            update.raw_json = json.dumps(state, default=str)[:20000]
+        op.status = 'succeeded' if verified else 'verification_pending'
+        op.state = 'Skipped' if verified else 'Verification pending'
+        op.ended_at = now() if verified else None
     except Exception as exc:
-        op.state = 'Skip outcome unknown'; op.status = 'outcome_unknown'; op.ended_at = now()
-        op.details_json = json.dumps({'update_id': update.id, 'entity_id': update.entity_id, 'target_version': update.available_version, 'service_payload': payload, 'error': {'type': type(exc).__name__, 'message': safe_exception_message(exc)}})
-        create_notification(db, severity='warning', title=f'Home Assistant skip failed: {inst.friendly_name} / {update.component}', body=safe_exception_message(exc), instance_id=inst.id, update_id=update.id)
-        audit(db, action='update_skip_failed', resource_type='update_record', resource_id=update.id, instance_id=inst.id, result='failed', metadata={'operation_id': op.id, 'error': type(exc).__name__})
+        from .bulk import LostLease, DispatchDenied
+        if isinstance(exc, (LostLease, DispatchDenied)):
+            raise
+        op.status = 'verification_pending' if post_attempted else 'blocked'
+        op.state = 'Skip outcome unverified; verification pending' if post_attempted else 'Skip rejected before dispatch'
+        op.ended_at = None if post_attempted else now()
+        op.error_code = type(exc).__name__
+        details['error'] = {'type': type(exc).__name__, 'message': safe_exception_message(exc)}
+    op.details_json = json.dumps(details)
+    audit(db, action='update_skipped' if op.status == 'succeeded' else 'update_skip_unverified', resource_type='update_record', resource_id=uid, instance_id=iid, result=op.status, metadata={'operation_id': op.id, 'actor': actor})
+    db.commit()
     return op
-
 
 def monitor_and_act(db: Session, *, auto_execute: bool = True, actor: str = 'automation') -> dict:
     job = JobRun(kind='monitor_and_act', status='running', started_at=now(), details_json='{}')

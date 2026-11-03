@@ -11,7 +11,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ..models import BackupRecord, JobRun, Operation, Instance, now
+from ..models import BackupRecord, JobRun, Operation, Instance, UpdateRecord, now
 
 ACTIVE_STATUSES = {'queued', 'running', 'restarting', 'reconnecting', 'accepted', 'verification_pending'}
 INCOMPATIBLE_KINDS = {'restart', 'repair_restart', 'repair_reboot', 'update_install', 'update_skip', 'backup_create'}
@@ -130,11 +130,23 @@ def _save(op: Operation, values: dict):
     op.updated_at = now()
 
 
+def durable_dispatch(op: Operation) -> bool:
+    details = _details(op)
+    return isinstance(details, dict) and details.get('dispatch_protocol') == 2
+
+
+def current_terminal_hold(op: Operation, current: datetime | None = None) -> bool:
+    """Do not retroactively impose queue rules on ancient legacy history."""
+    deadline = aware_utc(op.deadline_at)
+    return durable_dispatch(op) or bool(deadline and deadline >= aware_utc(current or now()) - timedelta(hours=12))
+
+
 def reconcile_operation(db: Session, op: Operation, *, adapter=None, now_value: datetime | None = None) -> Operation:
     current = aware_utc(now_value or now())
     assert current is not None
-    if op.status not in ACTIVE_STATUSES:
+    if op.status not in ACTIVE_STATUSES and not (op.status in {'outcome_unknown', 'action_required'} and op.kind in {'update_install', 'update_skip'}):
         return op
+    previous_status = op.status
     verified = False
     error = None
     try:
@@ -159,14 +171,17 @@ def reconcile_operation(db: Session, op: Operation, *, adapter=None, now_value: 
             d = _details(op); entity = d.get('entity_id'); target = d.get('target_version')
             state = adapter.get(f'/api/states/{entity}') if adapter and entity else {}
             attrs = state.get('attributes') or {}
-            verified = bool(target and attrs.get('installed_version') == target and not attrs.get('in_progress'))
-            if not verified and (attrs.get('in_progress') or state.get('state') in {'installing', 'updating'}):
-                op.status = 'reconnecting'; op.state = 'reconnecting'; _save(op, {'verification': 'still_in_progress'}); return op
+            verified = bool(target and attrs.get('installed_version') == target and not attrs.get('in_progress') and state.get('state') not in {'installing', 'updating'})
+            deadline = aware_utc(op.deadline_at)
+            if not verified and (deadline is None or current < deadline) and (attrs.get('in_progress') or state.get('state') in {'installing', 'updating'}):
+                op.status = previous_status if previous_status in {'outcome_unknown', 'action_required'} else 'reconnecting'
+                op.state = 'Target still in progress; previous hold preserved'
+                _save(op, {'verification': 'still_in_progress', 'verified': False}); return op
         elif op.kind == 'update_skip':
             d = _details(op); entity = d.get('entity_id'); target = d.get('target_version')
             state = adapter.get(f'/api/states/{entity}') if adapter and entity else {}
             attrs = state.get('attributes') or {}
-            verified = bool((target and attrs.get('skipped_version') == target) or state.get('state') in {'off', 'skipped'})
+            verified = bool(target and attrs.get('skipped_version') == target)
         elif op.kind == 'backup_create':
             d = _details(op)
             response = adapter.backup_info() if adapter and hasattr(adapter, 'backup_info') else (adapter.get('/api/backup') if adapter else {})
@@ -192,6 +207,22 @@ def reconcile_operation(db: Session, op: Operation, *, adapter=None, now_value: 
                     candidates = [(created, b) for created, b in dated if created and created >= attempted - timedelta(seconds=30)]
                     if candidates:
                         match = max(candidates, key=lambda item: item[0])[1]
+                automatic_failed = (
+                    belongs_to_operation
+                    and response.get('state') == 'idle'
+                    and (completed is None or (attempted is not None and completed < attempted))
+                )
+                if automatic_failed:
+                    # Reconciliation observes existing effects only. It must never
+                    # submit a fallback backup from startup, polling or a retry read.
+                    op.status = 'failed'; op.state = 'Automatic backup failed — explicit new request required'
+                    op.ended_at = current; op.error_code = 'automatic_backup_failed'
+                    _save(op, {'verification': 'automatic_backup_failed', 'verified': False,
+                               'recovery': 'request_new_backup_explicitly'})
+                    record = db.get(BackupRecord, d.get('backup_record_id')) if d.get('backup_record_id') else None
+                    if record:
+                        record.status = 'failed'
+                    return op
             verified = bool(match)
             if match:
                 backup_id = match.get('backup_id') or match.get('slug')
@@ -210,12 +241,52 @@ def reconcile_operation(db: Session, op: Operation, *, adapter=None, now_value: 
     except Exception as exc:
         error = type(exc).__name__
     if verified:
-        op.status = 'succeeded'; op.state = 'succeeded'; op.ended_at = current
+        # Read restart evidence before changing status, even when the cached update
+        # row was deleted. Missing/malformed evidence never releases a known hold.
+        repairs = []
+        if op.kind == 'update_install':
+            from .automation import _restart_repair_issues
+            repairs = _restart_repair_issues(adapter)
         op.error_code = None; op.error_message = None
-        _save(op, {'verified': True, 'verified_at': current.isoformat()})
+        if op.kind == 'update_install' and repairs is None:
+            deadline = aware_utc(op.deadline_at)
+            op.status = previous_status if previous_status in {'outcome_unknown', 'action_required'} else ('outcome_unknown' if deadline and current >= deadline else 'verification_pending')
+            op.state = 'Installed — restart clearance unverified'
+            op.ended_at = current if op.status == 'outcome_unknown' else None
+            if op.status == 'outcome_unknown':
+                op.error_code = 'restart_clearance_unverified'
+            _save(op, {'verified': False, 'installed_version_verified': True, 'restart_clearance_verified': False})
+        else:
+            op.status = 'action_required' if op.kind == 'update_install' and repairs else 'succeeded'
+            op.state = 'Installed — restart required' if op.status == 'action_required' else 'succeeded'
+            op.ended_at = current
+            _save(op, {'verified': op.status == 'succeeded', 'verified_at': current.isoformat()})
+            if op.kind == 'update_install':
+                _save(op, {'installed_version_verified': True, 'restart_clearance_verified': not bool(repairs), 'restart_repairs': repairs})
+        if op.kind in {'update_install', 'update_skip'}:
+            d = _details(op)
+            update = db.get(UpdateRecord, d.get('update_id')) if d.get('update_id') else None
+            if update is None:
+                update = db.query(UpdateRecord).filter_by(instance_id=op.instance_id, entity_id=d.get('entity_id')).first()
+            if update and update.instance_id == op.instance_id and update.entity_id == d.get('entity_id'):
+                update.raw_json = json.dumps(state, default=str)[:20000]
+                if op.kind == 'update_install':
+                    update.installed_version = attrs.get('installed_version')
+                    update.available_version = attrs.get('latest_version') or update.available_version
+                    update.installation_state = 'current' if update.installed_version == update.available_version else 'available'
+                    update.approval_state = 'not_required' if update.installation_state == 'current' else 'required'
+                    update.skip_state = 'none'
+                    if repairs is not None:
+                        update.restart_required = bool(repairs)
+                else:
+                    update.skip_state = 'skipped'; update.installation_state = 'skipped'
     else:
         deadline = aware_utc(op.deadline_at)
-        if deadline is not None and current >= deadline:
+        if previous_status in {'outcome_unknown', 'action_required'}:
+            op.status = previous_status
+            op.state = 'Restart hold unverified' if previous_status == 'action_required' else 'outcome_unknown'
+            _save(op, {'reason': error or 'state not confirmed; previous hold preserved', 'verified': False})
+        elif deadline is not None and current >= deadline:
             op.status = 'outcome_unknown'; op.state = 'outcome_unknown'; op.ended_at = current
             op.error_code = 'verification_deadline_expired'; op.error_message = error or 'state not confirmed'
             _save(op, {'reason': op.error_message, 'verified': False})
@@ -229,15 +300,21 @@ def reconcile_startup(db: Session, *, adapter_factory: Callable | None = None,
                       stale_after_seconds: int = 300, now_value: datetime | None = None) -> dict:
     current = aware_utc(now_value or now())
     result = {'operations': 0, 'jobs': 0, 'diagnostics': []}
-    for op in db.query(Operation).filter(Operation.status.in_(ACTIVE_STATUSES)).all():
+    for op in db.query(Operation).filter(Operation.status.in_(ACTIVE_STATUSES | {'outcome_unknown', 'action_required'})).all():
+        if op.status not in ACTIVE_STATUSES and not current_terminal_hold(op, current):
+            continue  # archived legacy terminal rows were never auto-reconciled
         result['operations'] += 1
         adapter = None
         if adapter_factory and op.instance_id:
             try: adapter = adapter_factory(op.instance_id)
             except Exception as exc: result['diagnostics'].append(type(exc).__name__)
         reconcile_operation(db, op, adapter=adapter, now_value=current)
+        db.commit()  # never hold the previous operation's writer across next HA call
     cutoff = current - timedelta(seconds=stale_after_seconds)
     for job in db.query(JobRun).filter(JobRun.status.in_(['running', 'accepted'])).all():
+        from .bulk import is_managed_job
+        if is_managed_job(job):
+            continue  # resumable bulk queues retain their complete durable intents
         if job.started_at and aware_utc(job.started_at) <= cutoff:
             job.status = 'failed'; job.ended_at = current
             job.details_json = json.dumps({'reason': 'startup_reconciliation', 'diagnostic': 'stale job closed'})

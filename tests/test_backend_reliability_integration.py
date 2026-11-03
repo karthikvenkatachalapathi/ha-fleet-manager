@@ -60,9 +60,12 @@ def test_skip_does_not_claim_success_when_state_cannot_be_verified(db, monkeypat
     db.flush()
 
     class Adapter:
-        def __init__(self, *_): pass
+        def __init__(self, *_): self.gets = 0
         def post(self, *_): return {}
-        def get(self, *_): raise TimeoutError("ambiguous")
+        def get(self, *_):
+            self.gets += 1
+            if self.gets == 1: return {'state': 'on', 'attributes': {'latest_version': '2'}}
+            raise TimeoutError("ambiguous")
 
     monkeypatch.setattr(automation, "HomeAssistantAdapter", Adapter)
     monkeypatch.setattr(automation, "CredentialService", lambda: type("C", (), {"get_instance_token": lambda self, db, iid: "token"})())

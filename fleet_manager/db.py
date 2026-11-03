@@ -1,4 +1,5 @@
 from __future__ import annotations
+from fastapi import Request
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from .settings import DATABASE_URL
@@ -19,9 +20,13 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, futu
 class Base(DeclarativeBase):
     pass
 
-def get_db():
+def get_db(request: Request = None):
     db = SessionLocal()
     try:
+        principal=getattr(request.state,'api_principal',None) if request else None
+        if principal is not None:
+            from .services.api_policy import bind_scope
+            bind_scope(db,principal)
         yield db
     finally:
         db.close()

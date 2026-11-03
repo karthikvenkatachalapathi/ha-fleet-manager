@@ -215,3 +215,29 @@ class PolicySetting(Base):
     value_json: Mapped[str] = mapped_column(Text, default='{}')
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+
+class ApiPrincipal(Base):
+    __tablename__ = 'api_principals'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    owner: Mapped[str] = mapped_column(String(160))
+    purpose: Mapped[str] = mapped_column(String(500))
+    role: Mapped[str] = mapped_column(String(20))
+    instance_ids_json: Mapped[str] = mapped_column(Text, default='[]')
+    all_instances: Mapped[bool] = mapped_column(Boolean, default=False)
+    include_future_instances: Mapped[bool] = mapped_column(Boolean, default=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class ApiToken(Base):
+    __tablename__ = 'api_tokens'
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    principal_id: Mapped[int] = mapped_column(ForeignKey('api_principals.id'), index=True)
+    verifier: Mapped[str] = mapped_column(String(64))
+    created_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -5,7 +5,7 @@ const tick=()=>new Promise(setImmediate);
 for(const outcome of ['success','failure'])for(const settleBeforeCore of [false,true])test(`poll overlapping manual repair ${outcome}, repair settles before core=${settleBeforeCore}`,async()=>{
  const repairs=deferred(),pollCore=deferred();let coreReads=0,repairReads=0;
  const c=createFleetRefreshController({paths:['/core','/repairs'],keys:['instances','repairs'],nonBlockingKeys:['repairs'],fetchJson:path=>{
-  if(path==='/api/sync-all')return {sync_failed:0};if(path==='/core')return ++coreReads===1?[{id:1}]:pollCore.promise;
+  if(path==='/api/sync-all')return {instances:1,sync_ok:1,sync_failed:0,results:[{instance_id:1,ok:true}]};if(path==='/core')return ++coreReads===1?[{id:1}]:pollCore.promise;
   repairReads++;return repairs.promise;
  }});
  await c.manualRefresh();assert.equal(c.getState().repairsPending,true);
